@@ -1,0 +1,155 @@
+{
+  "version": "1.0.0",
+  "tags": {
+    "master": {
+      "metadata": {
+        "name": "master",
+        "description": "Main task list for Polars String Similarity Kernels",
+        "created": "2025-01-27T00:00:00.000Z"
+      },
+      "tasks": [
+        {
+          "id": 1,
+          "title": "Environment Setup and Polars Codebase Onboarding",
+          "description": "Set up local Polars build environment, run existing tests, and study key modules to understand the codebase structure",
+          "status": "pending",
+          "priority": "high",
+          "dependencies": [],
+          "details": "This task involves:\n1. Setting up local Polars build environment (Rust toolchain, dependencies)\n2. Running existing test suites to verify environment is stable\n3. Studying relevant modules:\n   - polars-core: ChunkedArray and kernels code\n   - polars-plan: expression DSL and logical plan\n   - polars-expr: physical expression execution\n   - polars-ops: existing string operations\n   - py-polars: Python bindings for expressions\n4. Review Arrow UTF-8 and list/array layout (values, offsets, validity)\n5. Document a simplified internal map of where compute kernels live and how expressions get executed\n\nKey files to study:\n- crates/polars-core/src/chunked_array/\n- crates/polars-plan/src/dsl/\n- crates/polars-expr/src/\n- crates/polars-ops/src/chunked_array/strings/\n- py-polars/src/polars/",
+          "testStrategy": "Verify environment by running: cargo test --workspace (should pass existing tests)"
+        },
+        {
+          "id": 2,
+          "title": "Implement Hamming Similarity Kernel",
+          "description": "Implement normalized Hamming similarity kernel as the first metric to validate integration approach",
+          "status": "pending",
+          "priority": "high",
+          "dependencies": [1],
+          "details": "Implementation steps:\n1. Create new file: crates/polars-ops/src/chunked_array/strings/similarity.rs\n2. Implement hamming_similarity function:\n   - Input: &StringChunked, &StringChunked\n   - Output: Float32Chunked\n   - Algorithm: Count differing codepoints, normalize by length\n   - Return null if string lengths differ\n   - Return 1.0 if strings are identical\n   - Use codepoint-level comparison (chars() iterator)\n3. Handle null bitmaps correctly\n4. Support multi-chunk columns\n5. Add unit tests for:\n   - Equal strings (should return 1.0)\n   - Different strings of same length\n   - Mismatched lengths (should return null)\n   - Null inputs (should return null)\n   - Empty strings\n\nThis is the simplest algorithm and will validate the integration pattern.",
+          "testStrategy": "Unit tests covering all edge cases. Compare against reference implementation for known inputs."
+        },
+        {
+          "id": 3,
+          "title": "Implement Levenshtein Similarity Kernel",
+          "description": "Implement normalized Levenshtein similarity using Wagner-Fischer dynamic programming algorithm",
+          "status": "pending",
+          "priority": "high",
+          "dependencies": [2],
+          "details": "Implementation steps:\n1. Add levenshtein_similarity function to similarity.rs\n2. Implement Wagner-Fischer algorithm:\n   - Space-optimized version (O(min(n,m)) space instead of O(n×m))\n   - Use rolling rows to minimize memory\n3. Normalize result: 1.0 - (distance / max(len_a, len_b))\n4. Handle edge cases:\n   - Empty strings → return 1.0 if both empty\n   - Identical strings → return 1.0\n   - Null inputs → return null\n5. Use codepoint-level operations (.chars())\n6. Add comprehensive unit tests validated against RapidFuzz\n\nKey algorithm reference: Standard dynamic programming with memoization table.",
+          "testStrategy": "Unit tests with known input-output pairs validated against RapidFuzz library. Test various string lengths and edge cases."
+        },
+        {
+          "id": 4,
+          "title": "Implement Damerau-Levenshtein Similarity Kernel (OSA)",
+          "description": "Implement normalized Damerau-Levenshtein similarity using Optimal String Alignment variant",
+          "status": "pending",
+          "priority": "high",
+          "dependencies": [3],
+          "details": "Implementation steps:\n1. Add damerau_levenshtein_similarity function to similarity.rs\n2. Extend Levenshtein algorithm to handle transpositions:\n   - Add transposition operation (swap adjacent characters)\n   - Use OSA variant (each character can only be edited once)\n3. Normalize result: 1.0 - (distance / max(len_a, len(b)))\n4. Reuse Levenshtein machinery where possible\n5. Handle same edge cases as Levenshtein\n6. Add unit tests validated against RapidFuzz\n\nNote: OSA is simpler than full Damerau-Levenshtein and matches user expectations.",
+          "testStrategy": "Unit tests validated against RapidFuzz, including cases with transpositions (e.g., 'CA' vs 'ABC')."
+        },
+        {
+          "id": 5,
+          "title": "Implement Jaro-Winkler Similarity Kernel",
+          "description": "Implement Jaro-Winkler similarity with fixed parameters (prefix_weight=0.1, prefix_length=4)",
+          "status": "pending",
+          "priority": "high",
+          "dependencies": [3],
+          "details": "Implementation steps:\n1. Add jaro_winkler_similarity function to similarity.rs\n2. Implement Jaro similarity algorithm:\n   - Find matching characters within window\n   - Count transpositions\n   - Calculate Jaro score\n3. Apply Winkler modification:\n   - Check common prefix (up to 4 characters)\n   - Apply prefix_weight = 0.1\n   - Formula: jaro + (prefix_len * prefix_weight * (1 - jaro))\n4. Return Float32 in range [0.0, 1.0]\n5. Handle edge cases (nulls, empty strings)\n6. Add unit tests validated against RapidFuzz\n\nThis uses a different algorithm pattern than edit distances.",
+          "testStrategy": "Unit tests validated against RapidFuzz, including known test cases like 'MARTHA' vs 'MARHTA'."
+        },
+        {
+          "id": 6,
+          "title": "Implement Cosine Similarity Kernel for Vectors",
+          "description": "Implement cosine similarity for Array<f32> or List<f32> columns",
+          "status": "pending",
+          "priority": "high",
+          "dependencies": [2],
+          "details": "Implementation steps:\n1. Create new file: crates/polars-ops/src/chunked_array/array/similarity.rs\n2. Implement cosine_similarity function:\n   - Input: &ArrayChunked or &ListChunked (f32 elements)\n   - Output: Float32Chunked\n   - Algorithm: dot(a, b) / (||a|| * ||b||)\n3. Handle edge cases:\n   - Mismatched vector lengths → return null\n   - Zero-magnitude vectors → return null\n   - Empty vectors → return null\n   - Null inputs → return null\n4. Ensure numeric stability (small epsilon when dividing by norm)\n5. Support both Array<f32> and List<f32> types\n6. Add unit tests validated against NumPy/SciPy\n\nThis requires different data type handling than string metrics.",
+          "testStrategy": "Unit tests validated against NumPy cosine similarity. Test various vector sizes, edge cases, and numeric stability."
+        },
+        {
+          "id": 7,
+          "title": "Add FunctionExpr Variants for String Similarity",
+          "description": "Add StringSimilarity enum variant to FunctionExpr and StringSimilarityType enum",
+          "status": "pending",
+          "priority": "high",
+          "dependencies": [3, 4, 5],
+          "details": "Implementation steps:\n1. Locate FunctionExpr enum in polars-plan/src/dsl/functions.rs\n2. Add variant: StringSimilarity(StringSimilarityType)\n3. Create StringSimilarityType enum with variants:\n   - Levenshtein\n   - DamerauLevenshtein\n   - JaroWinkler\n   - Hamming\n4. Add variant: CosineSimilarity (for vector operations)\n5. Ensure serialization/deserialization works correctly\n6. Add tests for enum variants\n\nThis is the logical plan representation of the functions.",
+          "testStrategy": "Unit tests verifying enum variants can be created, serialized, and matched correctly."
+        },
+        {
+          "id": 8,
+          "title": "Implement DSL Methods in String Namespace",
+          "description": "Add helper methods to Utf8NameSpace for constructing string similarity expressions",
+          "status": "pending",
+          "priority": "high",
+          "dependencies": [7],
+          "details": "Implementation steps:\n1. Locate string namespace in polars-plan/src/dsl/strings.rs\n2. Add methods to Utf8NameSpace impl:\n   - levenshtein_sim(self, other: Expr) -> Expr\n   - damerau_levenshtein_sim(self, other: Expr) -> Expr\n   - jaro_winkler_sim(self, other: Expr) -> Expr\n   - hamming_sim(self, other: Expr) -> Expr\n3. Each method constructs Expr::Function with appropriate FunctionExpr variant\n4. Follow existing string namespace method patterns for literal handling\n5. Add tests that expressions can be constructed\n\nThese methods allow users to write: pl.col(\"name\").str.levenshtein_sim(other)",
+          "testStrategy": "Unit tests verifying expressions can be constructed and that they have correct FunctionExpr variants."
+        },
+        {
+          "id": 9,
+          "title": "Implement DSL Methods in Array Namespace",
+          "description": "Add cosine_similarity method to Array namespace for vector operations",
+          "status": "pending",
+          "priority": "high",
+          "dependencies": [6, 7],
+          "details": "Implementation steps:\n1. Locate array namespace in polars-plan/src/dsl/arrays.rs (or similar)\n2. Add method to ArrayNameSpace impl:\n   - cosine_similarity(self, other: Expr) -> Expr\n3. Construct Expr::Function with FunctionExpr::CosineSimilarity\n4. Follow existing array namespace patterns\n5. Add tests for expression construction\n\nThis allows users to write: pl.col(\"embedding\").arr.cosine_similarity(query_vec)",
+          "testStrategy": "Unit tests verifying cosine similarity expressions can be constructed correctly."
+        },
+        {
+          "id": 10,
+          "title": "Wire Up Physical Expression Builder",
+          "description": "Update physical expression builder to route FunctionExpr variants to concrete kernels",
+          "status": "pending",
+          "priority": "high",
+          "dependencies": [7, 8, 9],
+          "details": "Implementation steps:\n1. Locate physical expression builder in polars-lazy/src/physical_plan/expression.rs (or similar)\n2. Add match arms for:\n   - FunctionExpr::StringSimilarity(dist_type) → call appropriate kernel\n   - FunctionExpr::CosineSimilarity → call cosine similarity kernel\n3. Handle column-to-column and column-to-literal cases\n4. Ensure proper type checking and error handling\n5. Follow patterns from existing function implementations\n6. Add integration tests that expressions execute correctly\n\nThis connects the logical plan to actual kernel execution.",
+          "testStrategy": "Integration tests creating DataFrames, applying similarity expressions, and verifying correct results."
+        },
+        {
+          "id": 11,
+          "title": "Add Python Bindings for String Similarity",
+          "description": "Expose string similarity methods in Python expression API under .str namespace",
+          "status": "pending",
+          "priority": "medium",
+          "dependencies": [8, 10],
+          "details": "Implementation steps:\n1. Locate Python string namespace bindings in py-polars/src/polars/\n2. Add Python methods that wrap the Rust DSL methods:\n   - levenshtein_sim\n   - damerau_levenshtein_sim\n   - jaro_winkler_sim\n   - hamming_sim\n3. Ensure proper type hints and docstrings\n4. Follow existing Python binding patterns\n5. Test that methods are discoverable and callable from Python\n\nThis makes the functions accessible to Python users.",
+          "testStrategy": "Python tests verifying methods exist, can be called, and produce correct results."
+        },
+        {
+          "id": 12,
+          "title": "Add Python Bindings for Cosine Similarity",
+          "description": "Expose cosine_similarity method in Python expression API under .arr namespace",
+          "status": "pending",
+          "priority": "medium",
+          "dependencies": [9, 10],
+          "details": "Implementation steps:\n1. Locate Python array namespace bindings in py-polars/src/polars/\n2. Add Python method: cosine_similarity\n3. Ensure proper type hints and docstrings\n4. Handle list/array literal conversion\n5. Test Python API usage\n\nThis makes cosine similarity accessible to Python users.",
+          "testStrategy": "Python tests verifying cosine_similarity method works with Array columns and literals."
+        },
+        {
+          "id": 13,
+          "title": "Comprehensive Testing Suite",
+          "description": "Create comprehensive test suite with unit tests, edge cases, and validation against reference implementations",
+          "status": "pending",
+          "priority": "high",
+          "dependencies": [2, 3, 4, 5, 6, 10],
+          "details": "Testing requirements:\n1. Unit tests for each kernel:\n   - Known input-output pairs validated against RapidFuzz (strings) or NumPy (cosine)\n   - Edge cases: nulls, empty strings/vectors, mismatched lengths\n   - Multi-chunk column handling\n   - Null bitmap correctness\n2. Integration tests:\n   - Eager execution (DataFrame.select, with_columns)\n   - Lazy execution (LazyFrame.select)\n   - Group-by expressions\n   - Filter conditions using similarity scores\n3. Fuzz tests:\n   - Random strings/vectors, verify invariants\n   - Symmetry where applicable\n   - Non-negative distances (before normalization)\n4. Performance tests:\n   - Compare against Python UDF implementations\n   - Benchmark different string lengths and column sizes\n\nCreate test files:\n- crates/polars-ops/tests/strings_similarity.rs\n- crates/polars-ops/tests/array_similarity.rs\n- py-polars/tests/unit/expressions/test_string_similarity.py",
+          "testStrategy": "All tests should pass. Validation tests should match reference implementations within floating-point tolerance."
+        },
+        {
+          "id": 14,
+          "title": "Documentation and Examples",
+          "description": "Add documentation entries and usage examples for all similarity functions",
+          "status": "pending",
+          "priority": "medium",
+          "dependencies": [11, 12, 13],
+          "details": "Documentation requirements:\n1. Add docstrings to Rust functions with:\n   - Algorithm description\n   - Parameter explanations\n   - Return value ranges\n   - Edge case behaviors\n2. Add Python docstrings with examples\n3. Create usage examples:\n   - Fuzzy filtering and sorting by similarity\n   - Deduplication pipelines\n   - ML feature engineering with similarity features\n   - Cosine similarity for embedding-based ranking\n4. Update Polars expressions documentation\n5. Add performance notes and limitations\n\nDocumentation locations:\n- Rust: Inline doc comments\n- Python: py-polars/src/polars/ docstrings\n- Examples: examples/ directory or docs/",
+          "testStrategy": "Verify documentation builds correctly and examples run without errors."
+        }
+      ]
+    }
+  }
+}
+

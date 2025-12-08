@@ -1,0 +1,3211 @@
+# Polars String Similarity Kernels - Product Requirements Document
+
+## Project Overview
+Add new native string similarity and cosine similarity functions to Polars, enabling efficient fuzzy matching and text comparison at scale.
+
+## Core Requirements
+
+### Similarity Functions to Implement
+1. Hamming Similarity - Compare strings of equal length by counting differing codepoints
+2. Levenshtein Similarity - Edit distance based similarity using Wagner-Fischer algorithm
+3. Damerau-Levenshtein Similarity (OSA) - Edit distance with transposition support
+4. Jaro-Winkler Similarity - Prefix-weighted character matching algorithm
+5. Cosine Similarity - Vector similarity for embeddings (Array<f32> or List<f32>)
+
+### Technical Requirements
+
+#### Task 1: Environment Setup and Polars Codebase Onboarding
+Set up local Polars build environment, run existing tests, and study key modules:
+- polars-core: ChunkedArray and kernels code
+- polars-plan: expression DSL and logical plan
+- polars-expr: physical expression execution
+- polars-ops: existing string operations
+- py-polars: Python bindings
+- Review Arrow UTF-8 and list/array layout
+
+#### Task 2: Implement Hamming Similarity Kernel
+Create crates/polars-ops/src/chunked_array/strings/similarity.rs with:
+- Input: &StringChunked, &StringChunked
+- Output: Float32Chunked
+- Count differing codepoints, normalize by length
+- Return null if lengths differ, 1.0 if identical
+- Handle null bitmaps and multi-chunk columns
+
+#### Task 3: Implement Levenshtein Similarity Kernel
+Add levenshtein_similarity function:
+- Space-optimized Wagner-Fischer algorithm O(min(n,m))
+- Normalize: 1.0 - (distance / max(len_a, len_b))
+- Codepoint-level operations
+- Validate against RapidFuzz
+
+#### Task 4: Implement Damerau-Levenshtein Similarity (OSA)
+Extend Levenshtein for transpositions:
+- OSA variant (single edit per character)
+- Normalize result
+- Reuse Levenshtein machinery
+
+#### Task 5: Implement Jaro-Winkler Similarity
+Add jaro_winkler_similarity:
+- Jaro algorithm: matching chars in window, count transpositions
+- Winkler modification: prefix_weight=0.1, prefix_length=4
+- Formula: jaro + (prefix_len * 0.1 * (1 - jaro))
+
+#### Task 6: Implement Cosine Similarity for Vectors
+Create crates/polars-ops/src/chunked_array/array/similarity.rs:
+- Input: &ArrayChunked or &ListChunked (f32)
+- Algorithm: dot(a, b) / (||a|| * ||b||)
+- Handle mismatched lengths, zero-magnitude, nulls
+- Numeric stability with epsilon
+
+#### Task 7: Add FunctionExpr Variants
+In polars-plan/src/dsl/functions.rs:
+- Add StringSimilarity(StringSimilarityType) variant
+- Create StringSimilarityType enum: Levenshtein, DamerauLevenshtein, JaroWinkler, Hamming
+- Add CosineSimilarity variant
+- Ensure serialization works
+
+#### Task 8: DSL Methods in String Namespace
+In polars-plan/src/dsl/strings.rs (Utf8NameSpace):
+- levenshtein_sim(self, other: Expr) -> Expr
+- damerau_levenshtein_sim(self, other: Expr) -> Expr
+- jaro_winkler_sim(self, other: Expr) -> Expr
+- hamming_sim(self, other: Expr) -> Expr
+
+#### Task 9: DSL Methods in Array Namespace
+In polars-plan/src/dsl/arrays.rs (ArrayNameSpace):
+- cosine_similarity(self, other: Expr) -> Expr
+
+#### Task 10: Wire Up Physical Expression Builder
+In polars-lazy/src/physical_plan/expression.rs:
+- Add match arms for StringSimilarity and CosineSimilarity
+- Handle column-to-column and column-to-literal cases
+- Integration tests for expression execution
+
+#### Task 11: Python Bindings for String Similarity
+In py-polars/src/polars/ (.str namespace):
+- levenshtein_sim
+- damerau_levenshtein_sim
+- jaro_winkler_sim
+- hamming_sim
+- Type hints and docstrings
+
+#### Task 12: Python Bindings for Cosine Similarity
+In py-polars/src/polars/ (.arr namespace):
+- cosine_similarity method
+- Handle list/array literal conversion
+
+#### Task 13: Comprehensive Testing Suite
+Create test files:
+- crates/polars-ops/tests/strings_similarity.rs
+- crates/polars-ops/tests/array_similarity.rs
+- py-polars/tests/unit/expressions/test_string_similarity.py
+
+Include:
+- Unit tests with RapidFuzz/NumPy validation
+- Edge cases: nulls, empty strings, mismatched lengths
+- Integration tests: eager/lazy execution
+- Fuzz tests for invariants
+- Performance benchmarks
+
+#### Task 14: Documentation and Examples
+- Rust docstrings with algorithm descriptions
+- Python docstrings with examples
+- Usage examples: fuzzy filtering, deduplication, ML features
+- Performance notes and limitations
+
+## Dependencies
+- Task 1 is foundation (no dependencies)
+- Tasks 2-6 depend on Task 1 (kernel implementations)
+- Task 7 depends on Tasks 3-5 (needs kernels first)
+- Tasks 8-9 depend on Task 7 (DSL needs FunctionExpr)
+- Task 10 depends on Tasks 7-9 (wires up DSL to kernels)
+- Tasks 11-12 depend on Task 10 (Python wraps Rust)
+- Task 13 depends on Tasks 2-6, 10 (tests all components)
+- Task 14 depends on Tasks 11-13 (docs after implementation)
+
+## Success Criteria
+- All similarity functions return Float32 in [0.0, 1.0]
+- Results validate against RapidFuzz (strings) and NumPy (cosine)
+- Python API: df.select(pl.col("name").str.levenshtein_sim(other))
+- All tests pass, documentation complete
+
+## Performance Optimization Requirements
+
+### Phase 2: Performance Optimization
+
+After initial implementation and benchmarking, optimize similarity functions to match or exceed RapidFuzz performance, particularly for Levenshtein distance which currently shows 2.75-8.87x slower performance.
+
+#### High Priority Optimizations (High Impact, Easier Implementation)
+
+**Task 15: ASCII Fast Path Optimization**
+- Detect ASCII-only strings and use byte-level operations instead of Unicode codepoint iteration
+- Implement `levenshtein_distance_bytes()` for ASCII strings
+- Apply to all string similarity functions (Levenshtein, Damerau-Levenshtein, Jaro-Winkler, Hamming)
+- Expected impact: 2-5x speedup for common ASCII text
+
+**Task 16: Early Exit Optimizations**
+- Add length difference check: if `max_len - min_len > max_len / 2`, return early with similarity 0.0
+- Add identical string check before running full algorithm
+- Add early termination with threshold for bounded similarity queries
+- Expected impact: 1.5-3x speedup for mismatched strings
+
+**Task 17: Parallel Chunk Processing**
+- Use Rayon to process chunks in parallel
+- Implement parallel iterators for ChunkedArray operations
+- Ensure thread safety and proper null handling
+- Expected impact: 2-4x speedup on multi-core systems
+
+**Task 18: Memory Pool and Buffer Reuse**
+- Implement thread-local buffer pool for DP matrix rows
+- Reuse Vec allocations across function calls
+- Reduce allocation overhead in hot loops
+- Expected impact: 10-20% speedup, reduced memory pressure
+
+#### Medium Priority Optimizations (Moderate Complexity)
+
+**Task 19: Myers' Bit-Parallel Algorithm**
+- Implement Myers' bit-parallel algorithm for small strings (< 64 chars)
+- Use for bounded distance calculations
+- Fall back to Wagner-Fischer for larger strings
+- Expected impact: 2-3x speedup for short strings
+
+**Task 20: Early Termination with Threshold**
+- Add optional threshold parameter to similarity functions
+- Exit early if minimum distance exceeds threshold
+- Useful for filtering scenarios where only high-similarity matches are needed
+- Expected impact: 1.5-2x speedup for threshold-based queries
+
+**Task 21: Branch Prediction Optimization**
+- Add `#[likely]`/`#[unlikely]` attributes for common code paths
+- Optimize inner loop branches (character equality checks)
+- Use `#[inline(always)]` for hot functions
+- Expected impact: 5-15% speedup
+
+#### Advanced Optimizations (High Impact, Higher Complexity)
+
+**Task 22: SIMD Character Comparison**
+- Use SIMD instructions to compare multiple characters at once
+- Implement using `std::simd` or `portable_simd` feature
+- Vectorize character equality checks in inner loops
+- Expected impact: 2-4x speedup for character comparisons
+
+**Task 23: Inner Loop Optimization**
+- Unroll inner loops for small string lengths
+- Use unsafe indexing with bounds checks removed in hot paths
+- Optimize memory access patterns for cache efficiency
+- Expected impact: 10-30% speedup
+
+**Task 24: Integer Type Optimization**
+- Use `u16` or `u8` for distance calculations when strings are bounded
+- Reduce memory footprint and improve cache locality
+- Dynamic type selection based on string length
+- Expected impact: 5-15% speedup, reduced memory usage
+
+#### Cosine Similarity Optimizations
+
+**Task 25: SIMD for Cosine Similarity**
+- Vectorize dot product calculation using SIMD
+- Vectorize magnitude (sum of squares) computation
+- Use SIMD for element-wise multiplication
+- Expected impact: 3-5x speedup for vector operations
+
+**Task 26: Cosine Similarity Memory Optimization**
+- Optimize memory access patterns for vector operations
+- Cache-friendly iteration order
+- Reduce temporary allocations
+- Expected impact: 10-20% speedup
+
+#### Highest Impact Optimizations (Critical for Levenshtein Performance)
+
+**Task 27: Diagonal Band Optimization for Levenshtein (HIGHEST PRIORITY)**
+- Implement diagonal band algorithm to reduce computation from O(m×n) to O(m×k) where k is max distance
+- Only compute cells within diagonal band: [i-j] <= max_distance
+- Use banded matrix storage to reduce memory footprint
+- Estimate max distance from length difference and threshold
+- Apply to both bounded and unbounded Levenshtein calculations
+- Expected impact: 5-10x speedup for typical cases (makes Levenshtein competitive with RapidFuzz)
+- This is the highest ROI optimization - addresses the 8x performance gap
+
+**Task 28: SIMD for Diagonal Band Computation**
+- Add explicit SIMD vectorization to diagonal band algorithm
+- Use `std::simd` (portable_simd) to process multiple cells in band in parallel
+- Vectorize the min operations in the DP recurrence relation
+- Handle data dependencies in SIMD-friendly way
+- Runtime CPU feature detection (AVX-512, AVX2, SSE, NEON)
+- Expected impact: Additional 2-4x speedup on top of diagonal band (10-40x total vs baseline)
+- Would make Levenshtein significantly faster than RapidFuzz
+
+**Task 29: Explicit SIMD for Character Comparison**
+- Replace auto-vectorized character comparison with explicit `std::simd` implementation
+- Use `u8x64` vectors for AVX-512, `u8x32` for AVX2, `u8x16` for SSE/NEON
+- Implement `count_differences_simd()` using explicit SIMD intrinsics
+- Add CPU feature detection for optimal lane width selection
+- Expected impact: 2-4x additional speedup over current auto-vectorization
+- Applies to Hamming distance and character comparison in other algorithms
+
+**Task 30: Explicit SIMD for Cosine Similarity Enhancement**
+- Enhance existing cosine similarity SIMD with explicit `std::simd` implementation
+- Use `f64x8` vectors for AVX-512, `f64x4` for AVX2
+- Replace loop unrolling with explicit SIMD vector operations
+- Add CPU feature detection and runtime selection
+- Expected impact: Additional 2-3x speedup (20-50x total vs NumPy)
+
+#### Phase 2: Comprehensive SIMD Optimization (NEW)
+
+**Task 31: Jaro-Winkler SIMD Optimization (CRITICAL PRIORITY)**
+- **Status:** Currently 0.88x slower than RapidFuzz on large datasets - ONLY function slower than reference
+- **Priority:** CRITICAL - Highest ROI optimization
+- **Expected Impact:** 3-5x speedup (would make it 2.6-4.4x faster than RapidFuzz)
+
+**Subtask 31.1: SIMD Buffer Clearing**
+- Implement `clear_buffer_simd()` using u8x32 vectors
+- Replace loop-based buffer clearing in `jaro_similarity_bytes()`
+- Use `ptr::write_bytes` as fallback when SIMD unavailable
+- Expected: 10-20% speedup
+
+**Subtask 31.2: SIMD Character Comparison in Matching Loop**
+- Implement SIMD character matching using u8x32 vectors
+- Process 32 bytes at a time in matching window
+- Use `simd_eq()` and `to_bitmask()` for efficient comparison
+- Expected: 2-4x speedup for matching phase
+
+**Subtask 31.3: Early Exit Optimizations**
+- Add length difference check (return 0.0 if >50% difference)
+- Add character set overlap check for long strings (>10 chars)
+- Add `#[likely]`/`#[unlikely]` branch hints
+- Expected: 1.5-3x speedup for mismatched strings
+
+**Subtask 31.4: SIMD Transposition Counting**
+- Vectorize character comparison in transposition counting
+- Use SIMD for parallel character checks where possible
+- Expected: 5-15% speedup
+
+**Subtask 31.5: Hash-Based Matching for Long Strings (Optional)**
+- Use HashMap for O(1) character lookup when strings >50 chars
+- Fall back to SIMD matching for shorter strings
+- Expected: 3-5x speedup for very long strings
+
+**Task 32: Damerau-Levenshtein SIMD Optimization**
+- **Status:** Currently 1.90x faster than RapidFuzz, but no SIMD
+- **Priority:** High
+- **Expected Impact:** 2-3x speedup (would make it 3.8-5.7x faster than RapidFuzz)
+
+**Subtask 32.1: SIMD Min Operations for DP Matrix**
+- Implement `simd_min3_u32x8()` for parallel min operations
+- Vectorize the DP recurrence: `min(prev_row[i] + 1, curr_row[i-1] + 1, prev_row[i-1] + cost)`
+- Process 8 cells in parallel using u32x8 vectors
+- Expected: 2-3x speedup
+
+**Subtask 32.2: SIMD Character Comparison**
+- Use SIMD for cost calculation (character equality)
+- Vectorize the inner loop character comparisons
+- Expected: 10-20% additional speedup
+
+**Subtask 32.3: SIMD Transposition Check**
+- Vectorize the transposition condition check
+- Use SIMD for parallel character comparisons in transposition detection
+- Expected: 5-10% additional speedup
+
+**Task 33: Extend Levenshtein SIMD to Unbounded Queries**
+- **Status:** Currently only bounded queries have SIMD (partial coverage)
+- **Priority:** Medium
+- **Expected Impact:** 1.5-2x speedup for unbounded queries
+
+**Subtask 33.1: Adaptive Band with SIMD**
+- Extend `levenshtein_distance_adaptive_band()` to use SIMD
+- Apply SIMD min operations to adaptive band computation
+- Use runtime distance estimation for band width
+- Expected: 1.5-2x speedup
+
+**Subtask 33.2: SIMD for Standard Wagner-Fischer**
+- Add SIMD optimization to unbounded `levenshtein_distance_bytes()`
+- Vectorize min operations in DP recurrence
+- Process multiple cells in parallel
+- Expected: 1.2-1.5x speedup
+
+**Task 34: Enhanced SIMD for Cosine Similarity**
+- **Status:** Already has SIMD (39x faster), but can be enhanced
+- **Priority:** Low (already excellent performance)
+- **Expected Impact:** Additional 1.5-2x speedup (60-80x total vs NumPy)
+
+**Subtask 34.1: AVX-512 Support**
+- Add f64x8 vectors for AVX-512 capable CPUs
+- Runtime CPU feature detection
+- Process 8 doubles at a time (vs current 4)
+- Expected: 1.5-2x speedup on AVX-512 systems
+
+**Subtask 34.2: Fused Multiply-Add (FMA)**
+- Use FMA instructions for dot product: `a * b + acc`
+- More accurate and faster than separate multiply/add
+- Expected: 5-10% additional speedup
+
+### Phase 2 Implementation Strategy
+- **Week 1-2:** Task 31 (Jaro-Winkler SIMD) - CRITICAL
+- **Week 3-4:** Task 32 (Damerau-Levenshtein SIMD) - High
+- **Week 5:** Task 33 (Levenshtein SIMD extension) - Medium
+- **Week 6:** Task 34 (Cosine SIMD enhancement) - Low
+
+### Phase 3: Final Performance Gap Closure (NEW)
+
+These optimizations target the remaining performance gaps identified in benchmarking:
+- Hamming: RapidFuzz 1.14x faster on small datasets (1K strings)
+- Jaro-Winkler: RapidFuzz 1.08x faster on large datasets (100K strings)
+
+**Task 35: Hamming Similarity Small Dataset Optimization (HIGH PRIORITY)**
+- **Status:** RapidFuzz 1.14x faster on 1K strings (length 10)
+- **Root Cause:** Per-element overhead dominates for small strings
+- **Priority:** High
+- **Expected Impact:** 1.5-2x speedup on small datasets (would make Polars faster than RapidFuzz)
+
+**Subtask 35.1: Batch ASCII Detection at Column Level**
+- Check if entire column is ASCII once using SIMD scan
+- Store ASCII flag in column metadata or compute once per operation
+- Skip per-element `is_ascii_str()` checks when column is pure ASCII
+- Expected: 20-30% speedup by eliminating redundant checks
+
+**Subtask 35.2: Ultra-Fast Inline Path for Very Small Strings**
+- For strings ≤16 bytes, use completely inline comparison
+- No function calls, no bounds checks in hot path
+- Use `#[inline(always)]` and manual loop unrolling
+- Process 8 bytes at a time using u64 XOR comparison
+- Expected: 30-50% speedup for small strings
+
+**Subtask 35.3: Branchless XOR-Based Counting**
+- Replace `if s1[i] != s2[i] { 1 } else { 0 }` with branchless version
+- Use `((s1[i] ^ s2[i]) != 0) as usize` or SIMD popcount
+- Better CPU pipelining, no branch mispredictions
+- Expected: 10-20% speedup
+
+**Subtask 35.4: Specialized Column-Level Processing**
+- For homogeneous columns (all same length, all ASCII), bypass generic iterator
+- Implement `hamming_similarity_batch()` that processes entire column directly
+- Reduce per-element function call overhead
+- Expected: 15-25% speedup for batch processing
+
+**Task 36: Jaro-Winkler Large Dataset Optimization (CRITICAL PRIORITY)**
+- **Status:** RapidFuzz 1.08x faster on 100K strings (length 30)
+- **Root Cause:** Match window iteration and function call overhead
+- **Priority:** Critical
+- **Expected Impact:** 1.3-1.8x speedup on large datasets (would make Polars faster than RapidFuzz)
+
+**Subtask 36.1: Inline SIMD Character Search**
+- Inline `simd_find_match_in_range()` into main Jaro loop
+- Eliminates 3M+ function calls for 100K string pairs
+- Use `#[inline(always)]` or manual inlining
+- Expected: 15-25% speedup from eliminated call overhead
+
+**Subtask 36.2: Bit-Parallel Match Tracking**
+- Replace `Vec<bool>` match arrays with `u64` bitmasks (up to 64 chars)
+- Use bit operations for match tracking: `matches |= 1 << j`
+- Check matches with: `(matches >> j) & 1 == 0`
+- Faster clearing, checking, and setting
+- Expected: 20-30% speedup
+
+**Subtask 36.3: Pre-Indexed Character Position Lookup**
+- Build character position index for s2: `HashMap<u8, SmallVec<[u8; 4]>>`
+- O(1) lookup for potential match positions instead of linear search
+- Especially effective for longer strings with repeated characters
+- Expected: 20-40% speedup for strings >20 chars
+
+**Subtask 36.4: Stack-Allocated Buffers for Small Strings**
+- Use `[bool; 64]` stack array instead of thread-local Vec for strings ≤64 chars
+- Eliminates `JARO_BUFFER.with()` overhead per call
+- Thread-local only for larger strings
+- Expected: 10-15% speedup
+
+**Subtask 36.5: Parallel Processing with Rayon**
+- Process multiple string pairs in parallel using Rayon
+- Split column into chunks, process chunks in parallel
+- Merge results maintaining order
+- Expected: 2-4x speedup on multi-core systems
+
+**Task 37: General Column-Level Optimizations (MEDIUM PRIORITY)**
+- **Priority:** Medium
+- **Expected Impact:** 10-20% speedup across all similarity functions
+
+**Subtask 37.1: Pre-scan Column Metadata**
+- Scan column once to determine: all ASCII? max length? min length?
+- Use metadata to select optimal algorithm path
+- Skip per-element checks when column is homogeneous
+
+**Subtask 37.2: Chunked Parallel Processing**
+- Implement chunked parallel iteration for all similarity functions
+- Use Rayon's `par_chunks()` for multi-threaded processing
+- Ensure thread-local buffers don't cause contention
+
+**Subtask 37.3: SIMD Column Scanning**
+- Use SIMD to scan columns for ASCII detection
+- Vectorized length extraction for batch processing
+- Pre-compute column statistics for algorithm selection
+
+### Phase 3 Implementation Strategy
+- **Week 1:** Task 35 (Hamming small dataset optimization) - High
+- **Week 2:** Task 36 (Jaro-Winkler large dataset optimization) - Critical
+- **Week 3:** Task 37 (General column-level optimizations) - Medium
+
+### Phase 4: Additional Jaro-Winkler Optimizations (NEW)
+
+These optimizations target further performance improvements for Jaro-Winkler similarity, building on the work completed in Tasks 31 and 36. Expected combined impact: 2-3x additional speedup (6-15x total vs baseline).
+
+#### High Priority Optimizations (Expected 1.5-2x Speedup)
+
+**Task 38: SIMD-Optimized Prefix Calculation**
+- **Priority:** High
+- **Expected Impact:** 10-20% speedup for prefix calculation
+- **Description:** Use SIMD to compare up to 4 bytes at once (MAX_PREFIX_LENGTH = 4) instead of iterating byte-by-byte
+- **Implementation:** 
+  - Create `calculate_prefix_simd()` using `u8x4` vectors
+  - Use `simd_eq()` and `to_bitmask()` for efficient comparison
+  - Fall back to scalar for strings < 4 bytes
+- **Location:** `jaro_winkler_similarity_impl()` and `jaro_winkler_similarity_impl_ascii()`
+
+**Task 39: Early Termination with Threshold**
+- **Priority:** High (CRITICAL for threshold-based queries)
+- **Expected Impact:** 2-5x speedup for threshold-based queries (common use case)
+- **Description:** Stop matching early if we can prove similarity will be below threshold
+- **Implementation:**
+  - Add `min_threshold` parameter to `jaro_similarity_bytes()` variants
+  - Calculate minimum matches needed for threshold using Jaro formula
+  - Early exit check: if remaining potential matches can't reach threshold, return None
+  - Integrate with `jaro_winkler_similarity_with_threshold()` function
+- **Location:** `jaro_similarity_bytes()`, `jaro_similarity_bytes_simd()`, `jaro_winkler_similarity_with_threshold()`
+
+**Task 40: Character Frequency Pre-Filtering**
+- **Priority:** High
+- **Expected Impact:** 15-30% speedup for character set overlap check
+- **Description:** Replace HashSet-based character set overlap check with 256-element array
+- **Implementation:**
+  - Create `check_character_set_overlap_fast()` using stack-allocated `[bool; 256]` array
+  - Count characters in s1, check overlap with s2 in single pass
+  - Zero allocation overhead, faster than HashSet for ASCII strings
+- **Location:** Replace `check_character_set_overlap()` in `jaro_similarity_bytes_simd()`
+
+#### Medium Priority Optimizations (Expected 1.2-1.5x Additional Speedup)
+
+**Task 41: Improved Transposition Counting with SIMD**
+- **Priority:** Medium
+- **Expected Impact:** 10-20% speedup for transposition counting
+- **Description:** Use SIMD to find next matched positions in s2_matches instead of sequential scanning
+- **Implementation:**
+  - Create `count_transpositions_simd_optimized()` function
+  - Use SIMD to scan `s2_matches` in 32-byte chunks
+  - Use `simd_eq()` and `to_bitmask()` to find next matched position
+  - Replace existing transposition counting in `jaro_similarity_bytes_simd_large()`
+- **Location:** `jaro_similarity_bytes_simd_large()`
+
+**Task 42: Optimized Hash-Based Implementation**
+- **Priority:** Medium
+- **Expected Impact:** 10-20% speedup for hash-based path
+- **Description:** Use `SmallVec` instead of `Vec<usize>` in HashMap to avoid heap allocations for small character sets
+- **Implementation:**
+  - Add `smallvec` dependency to `polars-ops/Cargo.toml`
+  - Replace `HashMap<u8, Vec<usize>>` with `HashMap<u8, SmallVec<[usize; 4]>>`
+  - Most strings have <10 unique characters, so SmallVec avoids allocations
+- **Location:** `jaro_similarity_bytes_hash_based()`
+
+**Task 43: Adaptive Algorithm Selection**
+- **Priority:** Medium
+- **Expected Impact:** 10-30% speedup by using optimal algorithm for each case
+- **Description:** Choose algorithm variant based on string characteristics (length, character distribution, etc.)
+- **Implementation:**
+  - Create `jaro_similarity_bytes_adaptive()` dispatch function
+  - Analyze string characteristics: unique character count, average frequency
+  - Select optimal algorithm:
+    - ≤64 chars: bit-parallel
+    - >50 chars + high frequency: hash-based
+    - Low diversity: hash-based with small maps
+    - Default: SIMD path
+  - Replace current dispatch logic in `jaro_similarity_bytes()`
+- **Location:** `jaro_similarity_bytes()`, new helper functions for character analysis
+
+### Phase 4 Implementation Strategy
+- **Week 1:** Tasks 38-40 (High priority optimizations) - Expected 1.5-2x speedup
+- **Week 2:** Tasks 41-43 (Medium priority optimizations) - Expected 1.2-1.5x additional speedup
+- **Week 3:** Integration testing and benchmarking
+
+### Optimization Success Criteria
+- Levenshtein similarity: Match or exceed RapidFuzz performance (currently 8x slower on large datasets)
+  - Target: 0.016-0.032s for 100K strings (currently 0.161s, RapidFuzz 0.0198s)
+  - Diagonal band optimization should achieve this
+  - SIMD enhancement should exceed RapidFuzz performance
+- **Hamming similarity: Exceed RapidFuzz on ALL dataset sizes**
+  - Small datasets (1K): Currently 1.14x slower → Target 1.2x+ faster
+  - Medium/Large: Already 1.73-2.45x faster → Maintain
+  - Task 35 should close the small dataset gap
+- Cosine similarity: Maintain and improve current 40-50x advantage over NumPy
+- **Jaro-Winkler similarity: Exceed RapidFuzz on ALL dataset sizes**
+  - Small/Medium: Already 2-3x faster → Maintain
+  - Large datasets (100K): Currently 1.08x slower → Target 1.3x+ faster
+  - Task 36 should close the large dataset gap
+- **Damerau-Levenshtein similarity: Improve from 1.90x to 3.5x+ faster than RapidFuzz**
+  - Task 32 SIMD optimization should achieve this
+- All optimizations maintain correctness (all tests still pass)
+- Benchmark results documented and tracked
+
+---
+
+## Phase 5: Basic Fuzzy Join Implementation
+
+After completing the similarity metrics (Phases 1-4), implement fuzzy join functionality that leverages these existing kernels to join DataFrames based on string similarity thresholds.
+
+### Overview
+
+Fuzzy joins match rows between two DataFrames where string columns are "similar enough" (above a threshold) rather than exactly equal. This is essential for:
+- Entity resolution (matching customer records across systems)
+- Deduplication (finding near-duplicate records)
+- Data cleaning (linking messy data to reference tables)
+- Record linkage across databases with inconsistent naming
+
+### Core API Design
+
+**Task 44: Define Fuzzy Join API and Types**
+- **Priority:** High
+- **Description:** Define the public API for fuzzy joins including type definitions, join arguments, and expression syntax
+- **Implementation:**
+  - Add `FuzzyJoinType` enum to `polars-ops/src/frame/join/args.rs`:
+    ```rust
+    pub enum FuzzyJoinType {
+        Levenshtein,
+        DamerauLevenshtein,
+        JaroWinkler,
+        Hamming,
+    }
+    ```
+  - Add `FuzzyJoinArgs` struct:
+    ```rust
+    pub struct FuzzyJoinArgs {
+        pub similarity_type: FuzzyJoinType,
+        pub threshold: f32,           // Minimum similarity (0.0 to 1.0)
+        pub left_on: String,          // Left column name
+        pub right_on: String,         // Right column name
+        pub suffix: String,           // Suffix for right columns (default: "_right")
+        pub keep: FuzzyJoinKeep,      // best_match, all_matches, first_match
+    }
+    ```
+  - Add `FuzzyJoinKeep` enum for output control
+- **Test Strategy:** Compile tests for type definitions, ensure serialization works
+
+**Task 45: Implement Core Fuzzy Join Logic**
+- **Priority:** High
+- **Dependencies:** Task 44
+- **Description:** Implement the core fuzzy join algorithm using nested loop approach
+- **Implementation:**
+  - Create `polars-ops/src/frame/join/fuzzy.rs`
+  - Implement `fuzzy_join_inner()` function:
+    ```rust
+    pub fn fuzzy_join_inner(
+        left: &DataFrame,
+        right: &DataFrame,
+        args: FuzzyJoinArgs,
+    ) -> PolarsResult<DataFrame>
+    ```
+  - Algorithm (O(n*m) baseline):
+    1. Extract string columns from both DataFrames
+    2. For each row in left, compute similarity with all rows in right
+    3. Filter pairs above threshold
+    4. Based on `keep` strategy, select matching rows
+    5. Build result DataFrame with matched rows
+  - Handle null values (null similarity = null, excluded from matches)
+  - Return joined DataFrame with similarity score column
+- **Test Strategy:** Unit tests with small DataFrames, validate correctness against manual calculations
+
+**Task 46: Implement Join Type Variants**
+- **Priority:** High
+- **Dependencies:** Task 45
+- **Description:** Implement left, right, outer, and cross fuzzy join variants
+- **Implementation:**
+  - `fuzzy_join_left()`: All left rows, matched right rows (nulls for non-matches)
+  - `fuzzy_join_right()`: All right rows, matched left rows
+  - `fuzzy_join_outer()`: All rows from both, matched where possible
+  - `fuzzy_join_cross()`: Cartesian product filtered by similarity
+  - Unified `fuzzy_join()` dispatcher function
+- **Test Strategy:** Test each variant with known expected outputs
+
+**Task 47: Add FunctionExpr for Fuzzy Join**
+- **Priority:** High
+- **Dependencies:** Task 46
+- **Description:** Integrate fuzzy join into the expression system
+- **Implementation:**
+  - Add `FuzzyJoin` variant to `FunctionExpr` in `polars-plan`
+  - Implement schema inference for fuzzy join output
+  - Handle serialization/deserialization
+  - Wire up in physical expression builder
+- **Test Strategy:** Expression round-trip tests, lazy evaluation tests
+
+**Task 48: DataFrame Method Interface**
+- **Priority:** High
+- **Dependencies:** Task 47
+- **Description:** Add `fuzzy_join` method to DataFrame
+- **Implementation:**
+  - In `polars-lazy/src/frame/mod.rs`, add:
+    ```rust
+    pub fn fuzzy_join(
+        self,
+        other: LazyFrame,
+        left_on: &str,
+        right_on: &str,
+        similarity: FuzzyJoinType,
+        threshold: f32,
+    ) -> LazyFrame
+    ```
+  - Support method chaining with other operations
+  - Validate column types (must be String/Utf8)
+  - Propagate errors for invalid configurations
+- **Test Strategy:** Integration tests with lazy and eager evaluation
+
+**Task 49: Python Bindings for Fuzzy Join**
+- **Priority:** High
+- **Dependencies:** Task 48
+- **Description:** Expose fuzzy join to Python API
+- **Implementation:**
+  - In `py-polars/polars/dataframe/frame.py`, add:
+    ```python
+    def fuzzy_join(
+        self,
+        other: DataFrame,
+        left_on: str,
+        right_on: str,
+        similarity: Literal["levenshtein", "damerau_levenshtein", "jaro_winkler", "hamming"] = "levenshtein",
+        threshold: float = 0.8,
+        suffix: str = "_right",
+        keep: Literal["best", "all", "first"] = "best",
+    ) -> DataFrame:
+        """
+        Join DataFrames based on string similarity.
+        
+        Parameters
+        ----------
+        other : DataFrame
+            Right DataFrame to join with
+        left_on : str
+            Column name in left DataFrame to match on
+        right_on : str  
+            Column name in right DataFrame to match on
+        similarity : str
+            Similarity metric: "levenshtein", "damerau_levenshtein", "jaro_winkler", "hamming"
+        threshold : float
+            Minimum similarity score (0.0 to 1.0) for a match
+        suffix : str
+            Suffix to add to right DataFrame columns
+        keep : str
+            "best" (highest similarity), "all" (all above threshold), "first" (first match)
+            
+        Returns
+        -------
+        DataFrame
+            Joined DataFrame with similarity scores
+        """
+    ```
+  - Add to LazyFrame as well
+  - Type hints and comprehensive docstrings
+- **Test Strategy:** Python unit tests, validate against Rust implementation
+
+**Task 50: Fuzzy Join Testing Suite**
+- **Priority:** High
+- **Dependencies:** Tasks 45-49
+- **Description:** Comprehensive test suite for fuzzy join functionality
+- **Implementation:**
+  - Create `crates/polars-ops/tests/fuzzy_join.rs`
+  - Create `py-polars/tests/unit/operations/test_fuzzy_join.py`
+  - Test cases:
+    - Basic inner/left/right/outer joins
+    - All similarity metrics
+    - Various threshold values
+    - Null handling
+    - Empty DataFrames
+    - Single row DataFrames
+    - Large DataFrames (performance)
+    - Unicode strings
+    - Edge cases (identical strings, completely different strings)
+  - Validate against manual calculations
+- **Test Strategy:** All tests pass, edge cases covered
+
+**Task 51: Fuzzy Join Documentation**
+- **Priority:** Medium
+- **Dependencies:** Task 50
+- **Description:** Document fuzzy join functionality with examples
+- **Implementation:**
+  - Rust docstrings with algorithm description
+  - Python docstrings with usage examples
+  - User guide section with:
+    - When to use fuzzy joins
+    - Choosing similarity metrics
+    - Threshold selection guidelines
+    - Performance considerations
+  - Example notebooks:
+    - Entity resolution example
+    - Deduplication workflow
+    - Data cleaning pipeline
+- **Test Strategy:** Documentation review, examples run successfully
+
+### Phase 5 Success Criteria
+- Fuzzy join works with all 4 string similarity metrics
+- Supports inner, left, right, outer join types
+- Python API: `df.fuzzy_join(other, "name", "company_name", similarity="jaro_winkler", threshold=0.85)`
+- All tests pass
+- Documentation complete with examples
+
+---
+
+## Phase 6: Optimized Fuzzy Join Implementation
+
+After basic fuzzy join is working, optimize for performance to handle large datasets efficiently.
+
+### Overview
+
+The basic O(n*m) fuzzy join becomes prohibitively slow for large datasets. This phase implements algorithmic optimizations to reduce comparisons and parallelize execution.
+
+### Blocking and Candidate Generation
+
+**Task 52: Implement Blocking Strategy**
+- **Priority:** High
+- **Dependencies:** Task 50
+- **Description:** Reduce comparisons using blocking (candidate generation)
+- **Implementation:**
+  - Create `FuzzyJoinBlocker` trait for pluggable blocking strategies
+  - Implement `FirstNCharsBlocker`:
+    - Group strings by first N characters
+    - Only compare within same block
+    - Configurable N (default: 3)
+  - Implement `NGramBlocker`:
+    - Generate n-grams for each string
+    - Use inverted index to find candidate pairs
+    - Only compare pairs sharing at least one n-gram
+  - Implement `LengthBlocker`:
+    - Group by string length buckets
+    - Only compare strings within length difference threshold
+  - Add `blocking` parameter to `FuzzyJoinArgs`
+- **Test Strategy:** Verify blocking doesn't miss valid matches, measure reduction in comparisons
+
+**Task 53: Implement Sorted Neighborhood Method**
+- **Priority:** Medium
+- **Dependencies:** Task 52
+- **Description:** Sort-based blocking for ordered string comparison
+- **Implementation:**
+  - Sort both columns by string value
+  - Use sliding window to compare nearby strings
+  - Window size configurable (default: 10)
+  - More efficient for already-sorted or nearly-sorted data
+  - Implement `SortedNeighborhoodBlocker`
+- **Test Strategy:** Compare results with full scan, measure speedup
+
+**Task 54: Multi-Column Blocking**
+- **Priority:** Medium
+- **Dependencies:** Task 52
+- **Description:** Support blocking on multiple columns
+- **Implementation:**
+  - Allow multiple blocking columns
+  - Combine blocking keys (e.g., first letter + state)
+  - Union or intersection of candidate pairs
+  - Add `blocking_on: Vec<String>` to args
+- **Test Strategy:** Multi-column blocking produces correct results
+
+### Parallel Execution
+
+**Task 55: Parallel Fuzzy Join with Rayon**
+- **Priority:** High
+- **Dependencies:** Task 52
+- **Description:** Parallelize fuzzy join across CPU cores
+- **Implementation:**
+  - Partition left DataFrame into chunks
+  - Process chunks in parallel using Rayon
+  - Each thread computes matches for its chunk
+  - Merge results while maintaining row order
+  - Thread-local similarity computation (no contention)
+  - Configurable parallelism (num_threads parameter)
+- **Test Strategy:** Results match single-threaded, measure multi-core speedup
+
+**Task 56: Batch Similarity Computation**
+- **Priority:** High
+- **Dependencies:** Task 55
+- **Description:** Compute similarities in batches for better cache utilization
+- **Implementation:**
+  - Process blocks of (left_rows × right_rows) at a time
+  - Optimize memory access patterns
+  - Reuse buffers across batch computations
+  - Tune batch size for cache efficiency (default: 1024)
+- **Test Strategy:** Benchmark batch vs row-by-row, measure cache efficiency
+
+### Index-Based Optimization
+
+**Task 57: Implement Similarity Index**
+- **Priority:** Medium
+- **Dependencies:** Task 52
+- **Description:** Pre-compute index structure for faster lookups
+- **Implementation:**
+  - Create `SimilarityIndex` struct
+  - Build inverted index of n-grams → row IDs
+  - For each query string:
+    - Generate n-grams
+    - Look up candidate row IDs
+    - Score only candidates
+  - Support incremental index updates
+  - Persist index for reuse
+- **Test Strategy:** Index produces same results as full scan, faster lookup
+
+**Task 58: BK-Tree for Edit Distance**
+- **Priority:** Low
+- **Dependencies:** Task 57
+- **Description:** Implement BK-tree for efficient edit distance queries
+- **Implementation:**
+  - Build BK-tree from right DataFrame strings
+  - Query tree with threshold for candidates
+  - Prunes search space using triangle inequality
+  - Only applicable to Levenshtein/Damerau-Levenshtein
+  - Trade-off: build time vs query time
+- **Test Strategy:** BK-tree produces correct candidates, measure query speedup
+
+**Task 64: LSH (Locality Sensitive Hashing) Blocking Strategy**
+- **Priority:** High
+- **Dependencies:** Task 52
+- **Description:** Implement Locality Sensitive Hashing for approximate nearest neighbor blocking
+- **Implementation:**
+  - Create `LSHBlocker` struct implementing `FuzzyJoinBlocker` trait
+  - Implement MinHash LSH for Jaccard similarity estimation:
+    - Generate shingles (character n-grams) from strings
+    - Apply multiple hash functions to create signature
+    - Band the signature into b bands of r rows
+    - Hash each band to bucket - strings in same bucket are candidates
+  - Implement SimHash LSH for cosine/angular similarity:
+    - Generate character-level feature vectors
+    - Apply random hyperplane hashing
+    - Strings with same hash bits are candidates
+  - Configurable parameters:
+    - `num_hashes`: Number of hash functions (default: 100)
+    - `num_bands`: Number of bands for banding (default: 20)
+    - `shingle_size`: Size of character shingles (default: 3)
+  - Add `BlockingStrategy::LSH { num_hashes, num_bands, shingle_size }` variant
+  - Support both MinHash and SimHash variants
+  - Tune parameters for target similarity threshold using formulas:
+    - Probability of becoming candidate: 1 - (1 - s^r)^b where s is similarity
+- **Expected Impact:** 
+  - Sub-linear candidate generation O(n) instead of O(n*m)
+  - 95-99% reduction in comparisons for large datasets
+  - Especially effective for 10K+ rows
+- **Test Strategy:** 
+  - Verify LSH produces candidates with high recall (>95%)
+  - Measure precision/recall tradeoff at different parameter settings
+  - Benchmark against other blocking strategies on large datasets
+
+**Task 65: Memory-Efficient Batch Processing for Large Datasets**
+- **Priority:** High
+- **Dependencies:** Task 56
+- **Description:** Implement streaming batch processing to handle datasets larger than memory
+- **Implementation:**
+  - Create `BatchedFuzzyJoin` struct for memory-efficient processing:
+    ```rust
+    pub struct BatchedFuzzyJoin {
+        batch_size: usize,        // Rows per batch (default: 10000)
+        memory_limit_mb: usize,   // Max memory usage (default: 1024)
+        streaming_mode: bool,     // Process without loading all data
+    }
+    ```
+  - Implement chunked processing pipeline:
+    1. Split left DataFrame into batches
+    2. For each left batch:
+       a. Build temporary index for right DataFrame (or iterate in batches)
+       b. Compute matches for current batch
+       c. Yield results, release memory
+    3. Merge results maintaining order
+  - Memory-aware batch sizing:
+    - Estimate memory per row based on string lengths
+    - Dynamically adjust batch size to stay within limit
+  - Streaming output mode:
+    - Return iterator instead of collecting all results
+    - Enable processing of unbounded data streams
+  - Add Python API:
+    ```python
+    df.fuzzy_join(
+        other,
+        left_on="name", right_on="company",
+        batch_size=10000,
+        memory_limit_mb=1024,
+        streaming=True,  # Returns iterator
+    )
+    ```
+- **Expected Impact:**
+  - Enable fuzzy joins on datasets 10x larger than RAM
+  - Predictable memory usage regardless of input size
+  - 10-30% overhead for batching vs in-memory
+- **Test Strategy:**
+  - Process 10M row dataset with 2GB memory limit
+  - Verify results match non-batched processing
+  - Measure memory usage stays within limits
+
+**Task 66: Progressive Batch Processing with Early Results**
+- **Priority:** Medium
+- **Dependencies:** Task 65
+- **Description:** Return partial results as batches complete for faster time-to-first-result
+- **Implementation:**
+  - Implement `FuzzyJoinIterator` for streaming results:
+    ```rust
+    pub struct FuzzyJoinIterator {
+        left_batches: BatchIterator,
+        right_df: DataFrame,
+        args: FuzzyJoinArgs,
+        current_batch: usize,
+    }
+    
+    impl Iterator for FuzzyJoinIterator {
+        type Item = PolarsResult<DataFrame>;
+        fn next(&mut self) -> Option<Self::Item>;
+    }
+    ```
+  - Progressive result delivery:
+    - Yield results as each batch completes
+    - Allow early termination after N results
+    - Support `take(n)` to limit results
+  - Priority ordering for `keep="best"`:
+    - Use heap to track best matches across batches
+    - Optionally sort candidates by blocking score first
+  - Add callback API for progress reporting:
+    ```python
+    def on_progress(batch_num, total_batches, matches_found):
+        print(f"Batch {batch_num}/{total_batches}: {matches_found} matches")
+    
+    df.fuzzy_join(other, ..., on_progress=on_progress)
+    ```
+- **Expected Impact:**
+  - Time to first result: <1s for any dataset size
+  - Memory usage: O(batch_size) instead of O(n)
+  - Better user experience for interactive use
+- **Test Strategy:**
+  - Verify streaming results match batch results
+  - Measure time-to-first-result improvement
+  - Test early termination correctness
+
+**Task 67: Batch-Aware Blocking Integration**
+- **Priority:** Medium
+- **Dependencies:** Task 64, Task 65
+- **Description:** Optimize blocking strategies to work efficiently with batch processing
+- **Implementation:**
+  - Persistent blocking index:
+    - Build blocking index once for right DataFrame
+    - Reuse across all left batches
+    - Memory-map large indices to disk
+  - Incremental blocking for streaming:
+    - Update blocking index as new data arrives
+    - Support append-only index updates
+  - Batch-aware candidate generation:
+    - Generate candidates per batch efficiently
+    - Avoid redundant index lookups
+  - LSH with batching:
+    - Build LSH index for right DataFrame once
+    - Query index for each left batch
+    - Support disk-backed LSH index for large datasets
+  - Add index persistence API:
+    ```python
+    # Build and save index
+    index = other["company"].str.build_blocking_index(
+        strategy="lsh",
+        num_hashes=100,
+    )
+    index.save("company_lsh_index.bin")
+    
+    # Load and use in batched join
+    index = pl.load_blocking_index("company_lsh_index.bin")
+    df.fuzzy_join(other, ..., blocking_index=index, batch_size=10000)
+    ```
+- **Expected Impact:**
+  - Amortize index building cost across batches
+  - Enable batch processing with O(1) blocking lookups
+  - Support datasets 100x larger than RAM with blocking
+- **Test Strategy:**
+  - Verify index persistence correctness
+  - Benchmark batched blocking vs rebuilding per batch
+  - Test memory-mapped index performance
+
+### Threshold Optimization
+
+**Task 59: Early Termination in Batch Joins**
+- **Priority:** High
+- **Dependencies:** Task 56
+- **Description:** Stop computing similarity once threshold is determined
+- **Implementation:**
+  - Use bounded distance algorithms from Phase 2
+  - For `keep="best"`, track current best and prune
+  - For `keep="first"`, stop after first match
+  - Skip remaining comparisons when threshold can't be met
+- **Test Strategy:** Results match full computation, measure comparisons saved
+
+**Task 60: Adaptive Threshold Estimation**
+- **Priority:** Low
+- **Dependencies:** Task 59
+- **Description:** Automatically suggest optimal threshold
+- **Implementation:**
+  - Sample pairs from both DataFrames
+  - Compute similarity distribution
+  - Suggest threshold based on distribution (e.g., 90th percentile)
+  - Provide confidence metrics
+  - Add `estimate_threshold()` utility function
+- **Test Strategy:** Threshold suggestions produce reasonable match rates
+
+### Python API Enhancements
+
+**Task 61: Python Fuzzy Join Optimizations**
+- **Priority:** Medium
+- **Dependencies:** Tasks 52-60
+- **Description:** Expose optimization parameters to Python
+- **Implementation:**
+  - Add blocking parameters to Python API
+  - Add parallel execution control
+  - Add index building/loading methods
+  - Performance hints in docstrings
+  - Example:
+    ```python
+    df.fuzzy_join(
+        other,
+        left_on="name",
+        right_on="company",
+        similarity="jaro_winkler",
+        threshold=0.85,
+        blocking="first_chars",
+        blocking_chars=3,
+        parallel=True,
+        n_threads=4,
+    )
+    ```
+- **Test Strategy:** Python tests for all optimization options
+
+**Task 62: Fuzzy Join Performance Benchmarks**
+- **Priority:** Medium
+- **Dependencies:** Task 61
+- **Description:** Comprehensive benchmarking suite
+- **Implementation:**
+  - Create benchmark datasets (1K, 10K, 100K, 1M rows)
+  - Benchmark all similarity metrics
+  - Benchmark blocking strategies
+  - Benchmark parallel scaling
+  - Compare with alternatives (recordlinkage, dedupe libraries)
+  - Document performance characteristics
+- **Test Strategy:** Benchmarks run successfully, results documented
+
+**Task 63: Fuzzy Join Advanced Documentation**
+- **Priority:** Medium
+- **Dependencies:** Task 62
+- **Description:** Performance tuning guide and advanced usage
+- **Implementation:**
+  - Performance tuning guide:
+    - When to use blocking
+    - Choosing blocking strategy
+    - Parallel execution guidelines
+    - Memory considerations
+  - Advanced examples:
+    - Large-scale entity resolution
+    - Incremental matching
+    - Multi-pass deduplication
+  - API reference for all parameters
+- **Test Strategy:** Documentation review, examples verified
+
+### Phase 6 Success Criteria
+- 10-100x speedup over baseline for large datasets (100K+ rows)
+- Blocking reduces comparisons by 90%+ while maintaining accuracy
+- LSH blocking achieves 95-99% comparison reduction on 10K+ rows
+- Batch processing enables fuzzy joins on datasets 10x larger than RAM
+- Parallel execution scales linearly with cores
+- Python API exposes all optimization options
+- Benchmarks show competitive performance with specialized libraries
+- Documentation covers all optimization strategies
+
+### Phase 5 & 6 Dependencies
+- Phase 5 (Tasks 44-51) depends on Phase 1-4 completion (similarity metrics)
+- Task 44-46 can proceed in parallel
+- Task 47-49 depend on core logic (Task 45-46)
+- Task 50-51 depend on all Phase 5 tasks
+- Phase 6 (Tasks 52-67) depends on Phase 5 completion
+- Tasks 52-54 (blocking) can proceed in parallel
+- Task 64 (LSH blocking) depends on Task 52 (blocking infrastructure)
+- Tasks 55-56 (parallelization) can proceed in parallel with blocking
+- Tasks 57-58 (indexing) depend on blocking
+- Tasks 59-60 (threshold optimization) can proceed independently
+- Tasks 65-66 (batch processing) depend on Task 56 (batch similarity)
+- Task 67 (batch-aware blocking) depends on Tasks 64 and 65
+- Tasks 61-63 depend on all optimization tasks including 64-67
+
+---
+
+## Phase 7: Advanced Blocking & Automatic Optimization
+
+After Phase 6's basic blocking strategies, this phase implements intelligent blocking that maximizes recall while maintaining performance through adaptive algorithms, automatic strategy selection, and approximate nearest neighbor pre-filtering.
+
+### Overview
+
+Current blocking strategies (FirstNChars, NGram, Length, SortedNeighborhood, LSH) all use **exact matching** for blocking keys. This means:
+- Two strings must share an exact prefix/n-gram/length/hash bucket to be compared
+- Valid matches can be missed if blocking keys don't match exactly
+- Example: "John" and "Jon" won't be compared if using FirstChars(3) blocking
+
+Phase 7 addresses this by:
+1. **Adaptive Blocking**: Use fuzzy matching for blocking keys (approximate blocking key matching)
+2. **Automatic Strategy Selection**: Intelligently choose optimal blocking strategy based on data characteristics
+3. **Approximate Nearest Neighbor Pre-filtering**: Use ANN for very large datasets (1M+ rows)
+4. **Aggressive Default Blocking**: Enable blocking by default with optimal parameters
+
+### Adaptive Blocking Strategy
+
+**Task 68: Implement Adaptive Blocking with Fuzzy Matching**
+
+- **Priority:** High
+- **Dependencies:** Task 52 (blocking infrastructure)
+- **Description:** Implement adaptive blocking that uses fuzzy matching for blocking keys instead of exact matching
+- **Implementation:**
+  - Create `AdaptiveBlocker` struct that wraps existing blocking strategies
+  - Add `max_key_distance` parameter (default: 1 edit distance for blocking keys)
+  - For FirstNChars: Allow approximate prefix matches (e.g., "Joh" matches "Jon" with distance 1)
+  - For NGram: Allow approximate n-gram matches (e.g., "abc" matches "abd" with distance 1)
+  - For Length: Already approximate (length difference), enhance with fuzzy length matching
+  - Expand blocking keys: Generate all keys within edit distance threshold
+  - Example: FirstNChars(3) with max_key_distance=1:
+    - "John" → keys: ["Joh", "Jon", "Jhn", "ohn"] (original + 1-edit variants)
+    - "Jon" → keys: ["Jon", "Joh", "Jhn", "oon"] (original + 1-edit variants)
+    - Both strings now share "Joh" and "Jon" keys → will be compared
+  - Add `BlockingStrategy::Adaptive { base_strategy, max_key_distance }` variant
+  - Integrate with existing blocking infrastructure
+- **Expected Impact:**
+  - 5-15% improvement in recall (fewer missed matches)
+  - 10-30% increase in candidate pairs (more comparisons, but still much less than full scan)
+  - Maintains 80-95% comparison reduction vs full scan
+- **Test Strategy:** Verify recall improvement on datasets with typos/errors in prefixes, measure precision/recall tradeoff
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy_blocking.rs`
+
+### Automatic Blocking Strategy Selection
+
+**Task 69: Implement Automatic Blocking Strategy Selection**
+
+- **Priority:** High
+- **Dependencies:** Task 68
+- **Description:** Automatically select optimal blocking strategy based on data characteristics
+- **Implementation:**
+  - Create `BlockingStrategySelector` that analyzes:
+    - Dataset size (n, m)
+    - String length distribution (mean, std, min, max)
+    - Character diversity (unique characters, entropy)
+    - Data distribution (sorted, random, clustered)
+    - Expected match rate (from threshold)
+  - Selection logic:
+    - **Small datasets (< 1K rows):** No blocking (full scan faster)
+    - **Medium datasets (1K-10K rows):** FirstChars(3) or NGram(3) based on prefix stability
+    - **Large datasets (10K-100K rows):** NGram(3) or SortedNeighborhood(10)
+    - **Very large datasets (100K+ rows):** LSH with auto-tuned parameters
+    - **Sorted data:** SortedNeighborhood (detect via prefix distribution)
+    - **High character diversity:** NGram (more robust to variations)
+    - **Low character diversity:** FirstChars (fewer collisions)
+  - Add `BlockingStrategy::Auto` variant that triggers automatic selection
+  - Cache selection results for repeated joins on same columns
+  - Provide `recommend_blocking_strategy()` utility function
+- **Expected Impact:**
+  - Users don't need to manually tune blocking parameters
+  - Optimal strategy selected automatically for each dataset
+  - 20-50% better performance vs manual strategy selection
+- **Test Strategy:** Test on various dataset characteristics, verify optimal strategy selected, benchmark performance
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy_blocking.rs`, new `fuzzy_blocking_auto.rs`
+
+### Approximate Nearest Neighbor Pre-filtering
+
+**Task 70: Implement Approximate Nearest Neighbor Pre-filtering for Large Datasets**
+
+- **Priority:** Medium
+- **Dependencies:** Task 64 (LSH), Task 69
+- **Description:** Use approximate nearest neighbor search for very large datasets (1M+ rows) to pre-filter candidates before exact similarity computation
+- **Implementation:**
+  - Create `ANNPreFilter` struct that wraps LSH or other ANN algorithms
+  - Two-stage filtering:
+    1. **ANN Stage**: Use LSH/ANN to find approximate nearest neighbors (fast, approximate)
+    2. **Exact Stage**: Compute exact similarity only for ANN candidates (slower, exact)
+  - For datasets > 1M rows:
+    - Build ANN index (LSH, HNSW, or FAISS-style)
+    - Query ANN index for each left string → get top-K approximate neighbors
+    - Only compute exact similarity for ANN candidates
+    - Reduces comparisons from O(n*m) to O(n*log(m) + n*K) where K << m
+  - Integrate with existing blocking:
+    - Use ANN as pre-filter, then apply blocking on ANN candidates
+    - Or use blocking first, then ANN on blocked candidates
+  - Configurable K (number of approximate neighbors to retrieve)
+  - Add `BlockingStrategy::ANN { k, lsh_config }` variant
+  - Support multiple ANN backends:
+    - LSH (already implemented)
+    - HNSW (Hierarchical Navigable Small World) - optional
+    - FAISS integration - optional
+- **Expected Impact:**
+  - Enable fuzzy joins on billion-scale datasets (1M+ rows)
+  - 100-1000x reduction in comparisons for very large datasets
+  - Sub-second query time for 1M+ row datasets
+- **Test Strategy:** Test on large synthetic datasets (1M+ rows), verify recall > 95%, benchmark query time
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy_blocking.rs`, new `fuzzy_ann.rs`
+
+### Aggressive Default Blocking
+
+**Task 71: Use Existing Blocking Strategies More Aggressively by Default**
+
+- **Priority:** Medium
+- **Dependencies:** Task 69
+- **Description:** Enable blocking by default with optimal parameters, make it easier to use
+- **Implementation:**
+  - Change default `BlockingStrategy` from `None` to `Auto` in `FuzzyJoinArgs`
+  - Auto-enable blocking when:
+    - Dataset size > 100 rows (left or right)
+    - Expected comparisons > 10,000 (n * m > 10,000)
+  - Provide smart defaults for blocking parameters:
+    - FirstChars: n = 3 (good balance of precision/recall)
+    - NGram: n = 3 (trigrams are standard)
+    - Length: max_diff = 2 (reasonable for most use cases)
+    - SortedNeighborhood: window = 10 (good for large datasets)
+    - LSH: Auto-tune based on dataset size and threshold
+  - Add `auto_blocking` parameter (default: true) to allow disabling
+  - Update Python API to enable blocking by default
+  - Add warnings when blocking is disabled for large datasets
+- **Expected Impact:**
+  - Users get optimal performance without manual configuration
+  - 90%+ of users benefit from automatic blocking
+  - Reduced support burden (fewer "why is my join slow?" questions)
+- **Test Strategy:** Test default behavior on various dataset sizes, verify blocking enabled appropriately
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/args.rs`, `fuzzy.rs`
+
+### Additional Optimizations
+
+**Task 72: Additional Performance Optimizations**
+
+- **Priority:** Low
+- **Dependencies:** Tasks 68-71
+- **Description:** Additional optimizations identified during Phase 7 implementation
+- **Potential Optimizations:**
+  - Blocking key caching: Cache generated blocking keys across multiple joins
+  - Parallel blocking key generation: Use Rayon for generating blocking keys
+  - Blocking index persistence: Save/load blocking indices for repeated joins
+  - Multi-threaded candidate generation: Parallelize candidate pair generation
+  - Blocking strategy combination: Better support for combining multiple strategies
+- **Implementation:** To be determined based on profiling results
+- **Test Strategy:** Profile and identify bottlenecks, implement targeted optimizations
+
+### Phase 7 Success Criteria
+- Adaptive blocking improves recall by 5-15% while maintaining 80-95% comparison reduction
+- Automatic strategy selection chooses optimal strategy for 90%+ of datasets
+- ANN pre-filtering enables fuzzy joins on 1M+ row datasets with sub-second query time
+- Blocking enabled by default improves performance for 90%+ of users
+- All optimizations maintain correctness (all tests still pass)
+- Performance benchmarks show improvement over Phase 6
+
+### Phase 7 Dependencies
+- Phase 7 (Tasks 68-72) depends on Phase 6 completion (Tasks 52-67)
+- Task 68 (Adaptive Blocking) depends on Task 52 (blocking infrastructure)
+- Task 69 (Auto Selection) depends on Task 68 (needs adaptive blocking for analysis)
+- Task 70 (ANN Pre-filtering) depends on Task 64 (LSH) and Task 69 (auto selection)
+- Task 71 (Aggressive Defaults) depends on Task 69 (auto selection)
+- Task 72 (Additional Optimizations) depends on Tasks 68-71
+
+---
+
+## Phase 8: Sparse Vector Blocking with TF-IDF and Cosine Similarity
+
+After Phase 7's LSH-based ANN approach, this phase implements an alternative blocking strategy using n-gram sparse vectors with TF-IDF weighting and cosine similarity thresholding. This approach is used by `pl-fuzzy-frame-match` (via `polars-simed`) and provides better recall and more intuitive parameter tuning compared to LSH.
+
+### Overview
+
+Current LSH (MinHash/SimHash) approach has limitations:
+- **Probabilistic**: 80-95% recall with potential false negatives
+- **Complex parameter tuning**: `num_hashes`, `num_bands` require understanding of banding probability formula
+- **Indirect similarity**: Estimates Jaccard similarity via signature comparison, not directly related to edit distance
+
+The Sparse Vector + Cosine Similarity approach addresses these:
+1. **Deterministic threshold**: Set minimum cosine similarity directly (0.0-1.0)
+2. **Higher recall**: Weighted matching captures more valid candidates
+3. **Better for edit distance**: TF-IDF weights penalize common n-grams, reward distinctive ones
+4. **Simpler tuning**: Only n-gram size and minimum cosine similarity to configure
+
+### How It Works
+
+1. **N-gram Tokenization**: Break strings into character n-grams (e.g., trigrams)
+2. **TF-IDF Weighting**: Weight n-grams by frequency (TF) and rarity (IDF)
+3. **Sparse Vector Representation**: Each string becomes a sparse vector of weighted n-grams
+4. **Inverted Index**: Build index mapping n-grams to (row_id, weight) pairs
+5. **Cosine Similarity via Dot Product**: Use inverted index for efficient sparse dot product
+6. **Threshold Filtering**: Return only candidate pairs above minimum cosine similarity
+
+### Core Implementation
+
+**Task 73: Implement TF-IDF N-gram Sparse Vector Blocker**
+
+- **Priority:** Critical
+- **Dependencies:** Task 52 (blocking infrastructure), Task 64 (NGramBlocker reference)
+- **Description:** Implement a blocking strategy using TF-IDF weighted n-gram sparse vectors with cosine similarity thresholding
+- **Implementation:**
+  - Create `SparseVectorBlocker` struct implementing `FuzzyJoinBlocker` trait:
+    ```rust
+    pub struct SparseVectorBlocker {
+        ngram_size: usize,           // Size of character n-grams (default: 3)
+        min_cosine_similarity: f32,  // Minimum cosine similarity threshold (default: 0.3)
+        idf: HashMap<String, f32>,   // Precomputed IDF values
+    }
+    ```
+  - Implement `build_idf()` to compute IDF from both columns:
+    - Count documents containing each n-gram
+    - IDF = ln(N / df) where N is total documents, df is document frequency
+  - Implement `to_sparse_vector()` to convert string to TF-IDF weighted sparse vector:
+    - Generate n-grams with term frequency counts
+    - Apply TF-IDF weighting: weight = tf * idf
+    - L2 normalize the vector for cosine similarity
+  - Implement efficient `generate_candidates()` using inverted index:
+    - Build inverted index: n-gram → Vec<(left_idx, weight)>
+    - For each right string, accumulate dot products via index lookups
+    - Filter by min_cosine_similarity threshold
+  - Add `BlockingStrategy::SparseVector { ngram_size, min_cosine_similarity }` variant
+- **Expected Impact:**
+  - 90-98% recall (higher than LSH's 80-95%)
+  - Deterministic results (no probabilistic false negatives)
+  - Better candidate quality (weighted matching)
+  - Simpler parameter tuning
+- **Test Strategy:** Compare recall/precision with LSH, benchmark on various dataset sizes
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy_sparse_vector.rs`
+
+**Task 74: Optimize Sparse Vector Operations**
+
+- **Priority:** High
+- **Dependencies:** Task 73
+- **Description:** Optimize sparse vector operations for performance
+- **Implementation:**
+  - **Subtask 74.1: Efficient IDF Computation**
+    - Use parallel iteration with Rayon for IDF computation
+    - Compute IDF incrementally during index building
+    - Cache IDF values for repeated joins on same columns
+  - **Subtask 74.2: SIMD-Accelerated Dot Product Accumulation**
+    - Use SIMD for parallel accumulation when multiple n-grams match
+    - Vectorize the score aggregation loop
+  - **Subtask 74.3: Memory-Efficient Inverted Index**
+    - Use `SmallVec<[(usize, f32); 8]>` for common n-grams
+    - Compress indices for memory efficiency
+    - Consider arena allocation for index entries
+  - **Subtask 74.4: Parallel Candidate Generation**
+    - Process right strings in parallel using Rayon
+    - Thread-local score accumulators to avoid contention
+    - Merge candidate lists efficiently
+  - **Subtask 74.5: Early Termination Optimizations**
+    - Track maximum possible remaining score
+    - Skip strings that can't reach threshold
+    - Use sorted n-gram iteration for better pruning
+- **Expected Impact:**
+  - 2-3x speedup over naive implementation
+  - Memory usage comparable to LSH
+  - Linear scaling with cores
+- **Test Strategy:** Benchmark against LSH, profile hotspots, measure memory usage
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy_sparse_vector.rs`
+
+**Task 75: Integrate BK-Tree with Sparse Vector Blocking**
+
+- **Priority:** High
+- **Dependencies:** Task 58 (BK-Tree), Task 73
+- **Description:** Create a hybrid blocking strategy combining BK-Tree for small edit distances with sparse vectors for general matching
+- **Implementation:**
+  - Create `HybridBlocker` that combines strategies:
+    ```rust
+    pub struct HybridBlocker {
+        bk_tree: Option<BKTree>,           // For Levenshtein with high thresholds
+        sparse_blocker: SparseVectorBlocker, // For general matching
+        use_bktree_threshold: f32,         // Use BK-Tree when threshold >= this (default: 0.8)
+    }
+    ```
+  - Selection logic:
+    - Levenshtein/Damerau-Levenshtein + threshold >= 0.8 → BK-Tree (100% recall, fast for small edit distance)
+    - Jaro-Winkler/Hamming or lower thresholds → Sparse Vector (weighted matching)
+  - Add `BlockingStrategy::Hybrid { use_bktree_threshold }` variant
+  - Auto-select in `BlockingStrategySelector` based on similarity metric and threshold
+- **Expected Impact:**
+  - 100% recall for high-threshold edit distance queries
+  - Optimal strategy for each similarity metric
+  - Best of both worlds: BK-Tree precision + sparse vector flexibility
+- **Test Strategy:** Compare with standalone strategies, verify optimal selection
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy_blocking.rs`
+
+**Task 76: Replace LSH with Sparse Vector in Auto-Selector**
+
+- **Priority:** High
+- **Dependencies:** Task 73, Task 74, Task 69
+- **Description:** Update the automatic blocking strategy selector to prefer sparse vector over LSH
+- **Implementation:**
+  - Update `BlockingStrategySelector::select_strategy()`:
+    ```rust
+    // Previous (Phase 7):
+    // 100K-1M comparisons → LSH
+    // 1M+ comparisons → ANN (LSH-based)
+    
+    // New (Phase 8):
+    // 10K-100K comparisons → SparseVector(min_cosine=0.3)
+    // 100K-1M comparisons → SparseVector(min_cosine=0.5)
+    // 1M+ comparisons → ANN with SparseVector backend
+    ```
+  - Update `ANNPreFilter` to optionally use sparse vectors instead of LSH:
+    ```rust
+    pub enum ANNBackend {
+        LSH(LSHBlocker),           // Original LSH backend (deprecated)
+        SparseVector(SparseVectorBlocker),  // New preferred backend
+    }
+    ```
+  - Keep LSH as fallback option for users who explicitly request it
+  - Update `BlockingStrategy::ANN` to support backend selection
+  - Update default parameters in `FuzzyJoinArgs`
+- **Expected Impact:**
+  - Better default performance for most use cases
+  - Close 28% performance gap with pl-fuzzy-frame-match
+  - Simpler parameter tuning for users
+- **Test Strategy:** Benchmark old vs new auto-selection, verify improved performance
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy_blocking.rs`, `args.rs`
+
+**Task 77: Add Cosine Similarity Threshold Parameter to Python API**
+
+- **Priority:** Medium
+- **Dependencies:** Task 76
+- **Description:** Expose sparse vector blocking parameters to Python API
+- **Implementation:**
+  - Update Python `fuzzy_join()` signature:
+    ```python
+    def fuzzy_join(
+        self,
+        other: DataFrame,
+        left_on: str,
+        right_on: str,
+        similarity: str = "levenshtein",
+        threshold: float = 0.8,
+        # New parameters for sparse vector blocking:
+        blocking: str = "auto",  # "auto", "sparse_vector", "lsh", "ngram", "first_chars", "none"
+        blocking_ngram_size: int = 3,
+        blocking_min_cosine: float = 0.3,  # Minimum cosine similarity for blocking
+        # Existing parameters:
+        keep: str = "best",
+        suffix: str = "_right",
+        parallel: bool = True,
+        **kwargs,
+    ) -> DataFrame:
+    ```
+  - Add documentation explaining blocking strategies:
+    - `"auto"`: Automatically select best strategy (recommended)
+    - `"sparse_vector"`: TF-IDF weighted n-gram sparse vectors with cosine similarity
+    - `"lsh"`: Locality Sensitive Hashing (legacy)
+    - `"ngram"`: Simple n-gram blocking (any shared n-gram = candidate)
+    - `"first_chars"`: First N characters blocking
+    - `"none"`: No blocking (full scan)
+  - Add `get_blocking_strategies()` function to list available strategies
+  - Update type hints and docstrings
+- **Expected Impact:**
+  - Users can fine-tune blocking behavior
+  - Clear documentation of blocking options
+  - Backwards compatible API
+- **Test Strategy:** Python tests for all blocking options, verify parameter validation
+- **Code Location:** `polars/py-polars/polars/dataframe/frame.py`
+
+**Task 78: Benchmark Sparse Vector vs LSH vs pl-fuzzy-frame-match**
+
+- **Priority:** High
+- **Dependencies:** Task 76
+- **Description:** Comprehensive benchmarking to validate sparse vector approach
+- **Implementation:**
+  - Create benchmark script comparing:
+    - Sparse Vector blocking (new)
+    - LSH blocking (current)
+    - NGram blocking (simple baseline)
+    - pl-fuzzy-frame-match (external reference)
+  - Benchmark dimensions:
+    - Dataset sizes: 1K, 10K, 100K, 1M rows
+    - Similarity metrics: Levenshtein, Jaro-Winkler, Damerau-Levenshtein
+    - Thresholds: 0.5, 0.7, 0.8, 0.9
+  - Metrics to measure:
+    - Candidate generation time
+    - Total fuzzy join time
+    - Recall (% of true matches found)
+    - Precision (% of candidates that are true matches)
+    - Memory usage
+    - Comparisons per second
+  - Generate comparison report and visualizations
+  - Document findings in `SPARSE_VECTOR_BENCHMARK.md`
+- **Expected Impact:**
+  - Validate sparse vector approach matches or exceeds pl-fuzzy-frame-match
+  - Identify optimal parameters for different use cases
+  - Provide evidence for default strategy selection
+- **Test Strategy:** Run benchmarks on standardized datasets, verify reproducibility
+- **Code Location:** `benchmark_sparse_vector.py`, `SPARSE_VECTOR_BENCHMARK.md`
+
+### Advanced Optimizations
+
+**Task 79: Adaptive Cosine Threshold Based on String Length**
+
+- **Priority:** Medium
+- **Dependencies:** Task 73
+- **Description:** Automatically adjust cosine similarity threshold based on string length characteristics
+- **Implementation:**
+  - Longer strings have more n-grams, so cosine similarity behaves differently
+  - Implement adaptive threshold:
+    ```rust
+    fn adaptive_threshold(base_threshold: f32, avg_length: f32) -> f32 {
+        // Shorter strings need lower threshold (fewer n-grams to match)
+        // Longer strings can use higher threshold (more n-grams to distinguish)
+        let length_factor = (avg_length / 10.0).min(1.5).max(0.5);
+        base_threshold * length_factor
+    }
+    ```
+  - Integrate with `SparseVectorBlocker`:
+    - Compute average string length from columns
+    - Adjust threshold automatically
+    - Allow user override
+  - Add `adaptive_threshold: bool` parameter (default: true)
+- **Expected Impact:**
+  - Better recall for short strings
+  - Better precision for long strings
+  - More consistent behavior across different datasets
+- **Test Strategy:** Test on datasets with varying string lengths, verify improved recall/precision
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy_sparse_vector.rs`
+
+**Task 80: Streaming Sparse Vector Index for Large Datasets**
+
+- **Priority:** Low
+- **Dependencies:** Task 73, Task 65 (batch processing)
+- **Description:** Support streaming/batched sparse vector blocking for datasets larger than memory
+- **Implementation:**
+  - Implement `StreamingSparseVectorBlocker`:
+    - Build IDF from sample of data (or full scan if memory allows)
+    - Process left DataFrame in batches
+    - For each batch, query inverted index and accumulate scores
+    - Yield candidates as batches complete
+  - Memory-efficient inverted index:
+    - Disk-backed index for very large right DataFrames
+    - Memory-mapped file for index storage
+    - Lazy loading of index entries
+  - Integrate with existing batch processing infrastructure (Task 65)
+  - Add `streaming: bool` parameter to `SparseVectorBlocker`
+- **Expected Impact:**
+  - Enable sparse vector blocking on datasets 10x larger than RAM
+  - Predictable memory usage regardless of input size
+  - Time-to-first-result improvement for large datasets
+- **Test Strategy:** Process large dataset with memory limit, verify results match non-streaming
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy_sparse_vector.rs`
+
+### Phase 8 Success Criteria
+- Sparse vector blocking achieves 90-98% recall (vs LSH's 80-95%)
+- Performance matches or exceeds pl-fuzzy-frame-match on all benchmark sizes
+- Close the 28% performance gap observed at 25M comparisons for Levenshtein
+- Auto-selector prefers sparse vector for medium-large datasets (10K-1M comparisons)
+- BK-Tree + Sparse Vector hybrid achieves 100% recall for high-threshold edit distance
+- Python API exposes all new blocking parameters
+- Comprehensive benchmarks document performance characteristics
+- All existing tests still pass
+
+### Phase 8 Dependencies
+- Phase 8 (Tasks 73-80) depends on Phase 6-7 completion (Tasks 52-72)
+- Task 73 (Core Sparse Vector) depends on Task 52 (blocking infrastructure)
+- Task 74 (Optimizations) depends on Task 73
+- Task 75 (BK-Tree Hybrid) depends on Task 58 (BK-Tree) and Task 73
+- Task 76 (Replace LSH) depends on Tasks 73-74 and Task 69 (auto-selector)
+- Task 77 (Python API) depends on Task 76
+- Task 78 (Benchmarks) depends on Task 76
+- Tasks 79-80 (Advanced) depend on Task 73
+
+---
+
+## Phase 9: Advanced SIMD and Memory Optimizations to Beat pl-fuzzy-frame-match
+
+After Phase 8's sparse vector blocking, this phase implements advanced SIMD optimizations and memory access patterns to consistently beat pl-fuzzy-frame-match across all similarity metrics and dataset sizes.
+
+### Overview
+
+Current benchmark analysis shows pl-fuzzy-frame-match is faster in some scenarios:
+- **Jaro-Winkler on medium datasets (1M comparisons):** pl-fuzzy-frame-match 15% faster
+- **Levenshtein on large datasets (4M comparisons):** pl-fuzzy-frame-match 10% faster
+- **Damerau-Levenshtein across many sizes:** pl-fuzzy-frame-match 2-10% faster
+
+Root causes identified:
+1. **Single-pair processing:** Current implementation processes one string pair at a time in SIMD
+2. **Thread-local overhead:** Buffer allocation through `thread_local!` adds overhead
+3. **Suboptimal dispatch for medium strings:** 15-30 char strings don't hit optimal code paths
+4. **SIMD width limitations:** Using 8-wide vectors when 16-wide AVX-512 available
+
+### High Priority Optimizations
+
+**Task 81: Batch-Level SIMD for Fuzzy Join (CRITICAL PRIORITY)**
+
+- **Priority:** Critical
+- **Dependencies:** Phase 8 completion
+- **Description:** Process multiple string pairs simultaneously using SIMD instead of one pair at a time
+- **Expected Impact:** 2-4x speedup for fuzzy join operations
+- **Implementation:**
+  - Create `compute_batch_similarities_simd8()` function that processes 8 pairs at once
+  - Group string pairs into SIMD-width batches for parallel processing
+  - Compute 8x8 = 64 similarities simultaneously using SIMD vectors
+  - Vectorize threshold filtering for batch results
+  - Integrate with existing batch processing infrastructure
+  - Key insight: Current approach processes one pair, applies SIMD within pair. New approach processes 8 pairs, applies SIMD across pairs for better ILP.
+- **Subtasks:**
+  - Subtask 81.1: Create `StringBatchSIMD8` struct for 8-pair batching
+  - Subtask 81.2: Implement `jaro_winkler_batch8()` for 8 concurrent Jaro-Winkler calculations
+  - Subtask 81.3: Implement `levenshtein_batch8()` for 8 concurrent Levenshtein calculations
+  - Subtask 81.4: Implement `damerau_levenshtein_batch8()` for 8 concurrent DL calculations
+  - Subtask 81.5: Integrate batch SIMD with fuzzy join pipeline
+  - Subtask 81.6: Add fallback path for non-multiple-of-8 batch sizes
+- **Test Strategy:** Benchmark batch SIMD vs single-pair SIMD, verify correctness
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy.rs`, new `fuzzy_simd_batch.rs`
+
+**Task 82: Stack Allocation for Medium Strings (HIGH PRIORITY)**
+
+- **Priority:** High
+- **Dependencies:** None (independent optimization)
+- **Description:** Use stack-allocated buffers instead of thread-local for strings ≤128 chars
+- **Expected Impact:** 10-20% reduction in overhead for common string sizes
+- **Implementation:**
+  - Create `levenshtein_distance_stack_optimized()` with `[usize; 129]` stack arrays
+  - Create `jaro_similarity_stack_optimized()` with `[bool; 65]` stack arrays
+  - Create `damerau_levenshtein_stack_optimized()` with `[usize; 129]` stack arrays
+  - Only use thread-local buffers for strings >128 chars (rare in practice)
+  - Eliminates `BUFFER.with()` overhead which adds ~5-10ns per call
+  - Integrate into main dispatch functions with length checks
+- **Subtasks:**
+  - Subtask 82.1: Implement stack-allocated Levenshtein for strings ≤128 chars
+  - Subtask 82.2: Implement stack-allocated Jaro-Winkler for strings ≤64 chars
+  - Subtask 82.3: Implement stack-allocated Damerau-Levenshtein for strings ≤128 chars
+  - Subtask 82.4: Update dispatch functions to prefer stack allocation
+  - Subtask 82.5: Benchmark thread-local vs stack allocation overhead
+- **Test Strategy:** Compare performance with thread-local version, verify correctness
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+### Medium Priority Optimizations
+
+**Task 83: Medium String Specialization for Jaro-Winkler (15-30 chars)**
+
+- **Priority:** Medium
+- **Dependencies:** Task 82
+- **Description:** Specialized Jaro-Winkler implementation optimized for the most common string lengths
+- **Expected Impact:** 15-30% speedup for Jaro-Winkler on typical name/company data
+- **Implementation:**
+  - Create `jaro_similarity_medium_strings()` for 15-30 char strings
+  - Use `[bool; 32]` stack-allocated match arrays (fits in L1 cache line)
+  - Inline SIMD character search using `u8x16` vectors for search windows
+  - Unroll match-finding loop for strings in this range
+  - Avoid hash-based path (overhead not worth it for medium strings)
+  - Key insight: 15-30 chars is the "sweet spot" where bit-parallel (≤64) is slower due to setup and hash-based (>50) is overkill
+- **Subtasks:**
+  - Subtask 83.1: Implement `jaro_similarity_medium_strings()` with stack allocation
+  - Subtask 83.2: Add inline SIMD character search for 16-byte windows
+  - Subtask 83.3: Optimize match-finding loop with manual unrolling
+  - Subtask 83.4: Integrate with dispatch logic in `jaro_similarity_bytes()`
+  - Subtask 83.5: Benchmark medium string path vs current implementation
+- **Test Strategy:** Profile on real-world name datasets, verify speedup
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+**Task 84: AVX-512 16-Wide Vectors for Levenshtein**
+
+- **Priority:** Medium
+- **Dependencies:** Task 28 (existing SIMD banded Levenshtein)
+- **Description:** Use `u32x16` vectors on AVX-512 capable CPUs for 2x wider SIMD
+- **Expected Impact:** 2x speedup on AVX-512 systems (Intel Xeon, AMD Zen4+)
+- **Implementation:**
+  - Create `levenshtein_distance_banded_avx512()` using `Simd<u32, 16>`
+  - Process 16 DP cells in parallel instead of current 8
+  - Runtime CPU feature detection using `is_x86_feature_detected!("avx512f")`
+  - Fallback to 8-wide implementation on non-AVX-512 systems
+  - Also implement AVX-512 for Damerau-Levenshtein
+- **Subtasks:**
+  - Subtask 84.1: Implement `levenshtein_distance_banded_avx512()` with u32x16
+  - Subtask 84.2: Implement `damerau_levenshtein_avx512()` with u32x16
+  - Subtask 84.3: Add runtime CPU feature detection for AVX-512
+  - Subtask 84.4: Create dispatch functions for optimal SIMD width selection
+  - Subtask 84.5: Benchmark AVX-512 vs AVX2 on supported hardware
+- **Test Strategy:** Test on AVX-512 and non-AVX-512 systems, verify correctness
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+### Low Priority Optimizations
+
+**Task 85: Transposition Pre-computation for Damerau-Levenshtein**
+
+- **Priority:** Low
+- **Dependencies:** Task 32 (existing DL SIMD)
+- **Description:** Pre-compute transposition positions to reduce inner loop comparisons
+- **Expected Impact:** 5-10% speedup for Damerau-Levenshtein
+- **Implementation:**
+  - Create `TranspositionMap` struct with bitmap storage
+  - Pre-compute all (i, j) positions where transposition is possible
+  - Replace 4 character comparisons per cell with O(1) bitmap lookup
+  - Trade memory (O(m*n) bits) for reduced comparisons
+  - Only use for medium-sized strings (10-100 chars) where benefit exceeds overhead
+- **Subtasks:**
+  - Subtask 85.1: Implement `TranspositionMap` struct with bitmap storage
+  - Subtask 85.2: Implement `precompute_transpositions()` function
+  - Subtask 85.3: Integrate pre-computed map with DL SIMD implementation
+  - Subtask 85.4: Add length-based dispatch to enable/disable pre-computation
+  - Subtask 85.5: Benchmark pre-computed vs inline transposition checks
+- **Test Strategy:** Profile on various string lengths, verify memory/speed tradeoff
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+**Task 86: Cache-Optimized Memory Access Patterns**
+
+- **Priority:** Low
+- **Dependencies:** None
+- **Description:** Optimize memory access patterns for better cache utilization
+- **Expected Impact:** 5-15% speedup from reduced cache misses
+- **Implementation:**
+  - Ensure DP row arrays are 64-byte aligned (cache line aligned)
+  - Process strings in cache-friendly order
+  - Prefetch next row data during current row computation
+  - Use cache blocking for very long strings
+- **Subtasks:**
+  - Subtask 86.1: Add cache line alignment to buffer allocations
+  - Subtask 86.2: Implement prefetching for next row data
+  - Subtask 86.3: Add cache blocking for strings >1024 chars
+  - Subtask 86.4: Profile cache miss rates before/after optimization
+- **Test Strategy:** Use perf/cachegrind to measure cache miss reduction
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+### Phase 9 Success Criteria
+- Beat pl-fuzzy-frame-match on ALL similarity metrics and dataset sizes
+- Batch-level SIMD achieves 2-4x speedup for fuzzy join operations
+- Stack allocation reduces overhead by 10-20% for medium strings
+- Medium string specialization improves Jaro-Winkler by 15-30%
+- AVX-512 implementation achieves 2x speedup on supported hardware
+- All existing tests still pass
+- Benchmark results documented and tracked
+
+### Phase 9 Dependencies
+- Phase 9 (Tasks 81-86) depends on Phase 8 completion (Tasks 73-80)
+- Task 81 (Batch SIMD) depends on fuzzy join batch processing infrastructure
+- Task 82 (Stack Allocation) is independent
+- Task 83 (Medium String) depends on Task 82
+- Task 84 (AVX-512) depends on Task 28 (existing SIMD)
+- Task 85 (Transposition Pre-compute) depends on Task 32 (DL SIMD)
+- Task 86 (Cache Optimization) is independent
+
+---
+
+## Phase 10: Comprehensive Batch SIMD Optimization
+
+After Phase 9's initial batch SIMD implementation, this phase extends batch SIMD to all code paths where it's currently missing, ensuring maximum performance across all fuzzy join scenarios.
+
+### Overview
+
+Current batch SIMD implementation (Task 81) only covers the main fuzzy join path when early termination is disabled. Analysis reveals several critical gaps:
+- **Sequential path with early termination**: Falls back to individual processing (2-4x performance loss)
+- **Hamming similarity**: Existing batch function not used (2-3x performance loss)
+- **Blocking candidate verification**: Candidates verified individually (2-3x performance loss)
+- **AVX-512 support**: Only 8-wide vectors used when 16-wide available (1.5-2x potential gain)
+
+This phase addresses all these gaps to achieve comprehensive batch SIMD coverage.
+
+### High Priority Optimizations
+
+**Task 87: Hybrid Early Termination with Batch SIMD (CRITICAL PRIORITY)**
+
+- **Priority:** Critical
+- **Dependencies:** Task 81 (existing batch SIMD infrastructure)
+- **Description:** Enable batch SIMD in sequential path when early termination is enabled
+- **Expected Impact:** 2-4x speedup for early termination scenarios (BestMatch, FirstMatch, AllMatches with limit)
+- **Implementation:**
+  - Modify `compute_batch_similarities_sequential()` to use batch SIMD
+  - Process pairs in batches of 8 using SIMD functions
+  - Check early termination conditions **after** each batch completes
+  - Maintain correctness: early termination still works, but with SIMD benefits
+  - Key insight: Batch SIMD and early termination are compatible - check termination after batch, not during
+- **Subtasks:**
+  - Subtask 87.1: Create `compute_batch_similarities_with_early_term_simd()` function
+  - Subtask 87.2: Group pairs into batches of 8 for SIMD processing
+  - Subtask 87.3: Integrate early termination checks after batch computation
+  - Subtask 87.4: Handle BestMatch strategy: track best similarity per left index
+  - Subtask 87.5: Handle FirstMatch strategy: stop after first match per left index
+  - Subtask 87.6: Handle AllMatches with limit: stop after reaching max matches
+  - Subtask 87.7: Update `compute_batch_similarities_with_termination()` to use new function
+  - Subtask 87.8: Benchmark early termination with/without batch SIMD
+- **Test Strategy:** Verify early termination correctness, measure speedup vs sequential processing
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy.rs`
+
+**Task 88: Use Existing Hamming Batch SIMD Function (HIGH PRIORITY)**
+
+- **Priority:** High
+- **Dependencies:** Task 81 (batch SIMD infrastructure exists)
+- **Description:** Replace individual Hamming processing with existing `compute_hamming_batch8()` function
+- **Expected Impact:** 2-3x speedup for Hamming similarity in fuzzy joins
+- **Implementation:**
+  - Update `process_simd8_batch()` to use `compute_hamming_batch8()` for Hamming similarity
+  - Filter equal-length pairs first (Hamming requires equal lengths)
+  - Use batch SIMD when all 8 pairs have equal lengths
+  - Fallback to individual processing only for mixed-length batches
+  - Remove redundant individual Hamming computation in batch path
+- **Subtasks:**
+  - Subtask 88.1: Update `process_simd8_batch()` to check for equal-length pairs
+  - Subtask 88.2: Call `compute_hamming_batch8()` when all pairs have equal lengths
+  - Subtask 88.3: Implement efficient equal-length filtering for batch
+  - Subtask 88.4: Update `process_remainder_batch()` to use batch Hamming when possible
+  - Subtask 88.5: Remove redundant `hamming_similarity_direct_bytes()` calls in batch path
+  - Subtask 88.6: Benchmark Hamming with/without batch SIMD
+- **Test Strategy:** Verify Hamming correctness, test with mixed-length batches, measure speedup
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy.rs`
+
+### Medium Priority Optimizations
+
+**Task 89: Batch SIMD for Blocking Candidate Verification (HIGH PRIORITY)**
+
+- **Priority:** High
+- **Dependencies:** Task 52 (blocking infrastructure), Task 81 (batch SIMD)
+- **Description:** Use batch SIMD to verify candidate pairs from blocking strategies
+- **Expected Impact:** 2-3x speedup for blocked fuzzy joins
+- **Implementation:**
+  - Modify `compute_fuzzy_matches_from_candidates()` to group candidates into batches of 8
+  - Use batch SIMD functions to verify candidate pairs
+  - Process full batches (8 pairs) with SIMD, handle remainders individually
+  - Maintain candidate pair ordering for correct result assembly
+  - Integrate with all blocking strategies (FirstNChars, NGram, Length, LSH, SparseVector)
+- **Subtasks:**
+  - Subtask 89.1: Create `verify_candidates_batch_simd()` function
+  - Subtask 89.2: Group candidate pairs into batches of 8
+  - Subtask 89.3: Extract string pairs for batch processing
+  - Subtask 89.4: Call appropriate batch SIMD function based on similarity type
+  - Subtask 89.5: Filter candidates above threshold using SIMD threshold filtering
+  - Subtask 89.6: Handle remainder candidates (< 8) efficiently
+  - Subtask 89.7: Update `compute_fuzzy_matches_from_candidates()` to use batch verification
+  - Subtask 89.8: Benchmark blocked joins with/without batch SIMD candidate verification
+- **Test Strategy:** Verify blocking correctness, test with various blocking strategies, measure speedup
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy.rs`
+
+**Task 90: AVX-512 16-Wide Batch SIMD Support (MEDIUM PRIORITY)**
+
+- **Priority:** Medium
+- **Dependencies:** Task 81 (8-wide batch SIMD), Task 84 (AVX-512 for individual similarity)
+- **Description:** Extend batch SIMD to use 16-wide AVX-512 vectors when available
+- **Expected Impact:** 1.5-2x speedup on AVX-512 capable CPUs (Intel Xeon, AMD Zen4+)
+- **Implementation:**
+  - Create 16-wide batch SIMD functions: `compute_*_batch16_with_threshold()`
+  - Implement for all similarity metrics: Jaro-Winkler, Levenshtein, Damerau-Levenshtein, Hamming
+  - Runtime CPU feature detection using `is_x86_feature_detected!("avx512f")`
+  - Auto-select 16-wide when AVX-512 available, fallback to 8-wide otherwise
+  - Update batch processing to handle 16-pair batches
+  - Process remainders efficiently (use 8-wide for 8-15 remainders)
+- **Subtasks:**
+  - Subtask 90.1: Implement `compute_jaro_winkler_batch16_with_threshold()` using Simd<f32, 16>
+  - Subtask 90.2: Implement `compute_levenshtein_batch16_with_threshold()` using Simd<f32, 16>
+  - Subtask 90.3: Implement `compute_damerau_levenshtein_batch16_with_threshold()` using Simd<f32, 16>
+  - Subtask 90.4: Implement `compute_hamming_batch16()` using Simd<f32, 16>
+  - Subtask 90.5: Add CPU feature detection for AVX-512
+  - Subtask 90.6: Create dispatch function to select 8-wide vs 16-wide based on CPU
+  - Subtask 90.7: Update `process_simd8_batch()` to handle 16-wide batches
+  - Subtask 90.8: Update batch grouping logic for 16-pair batches
+  - Subtask 90.9: Benchmark AVX-512 vs AVX2 on supported hardware
+- **Test Strategy:** Test on AVX-512 and non-AVX-512 systems, verify correctness, measure speedup
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`, `fuzzy.rs`
+
+### Low Priority Optimizations
+
+**Task 91: Optimize Remainder Batch Processing (LOW PRIORITY)**
+
+- **Priority:** Low
+- **Dependencies:** Task 81 (batch SIMD infrastructure)
+- **Description:** Use smaller SIMD batches or masked operations for remainder pairs (< 8)
+- **Expected Impact:** 10-20% speedup for remainder processing
+- **Implementation:**
+  - For remainders of size 4-7: use 4-wide or 8-wide with masking
+  - For remainders of size 1-3: process individually (overhead too high)
+  - Use SIMD mask operations to handle partial batches
+  - Or create specialized 4-wide batch functions for 4-7 remainders
+- **Subtasks:**
+  - Subtask 91.1: Implement masked SIMD operations for partial batches
+  - Subtask 91.2: Create 4-wide batch functions for 4-7 remainders
+  - Subtask 91.3: Update `process_remainder_batch()` to use optimized paths
+  - Subtask 91.4: Benchmark remainder processing with/without optimization
+- **Test Strategy:** Verify correctness for all remainder sizes, measure speedup
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy.rs`
+
+### Phase 10 Success Criteria
+- Batch SIMD used in all fuzzy join code paths (early termination, blocking, Hamming)
+- Early termination scenarios achieve 2-4x speedup with batch SIMD
+- Hamming similarity achieves 2-3x speedup using batch SIMD
+- Blocked joins achieve 2-3x speedup with batch SIMD candidate verification
+- AVX-512 support provides 1.5-2x additional speedup on supported CPUs
+- Remainder processing optimized for 10-20% improvement
+- All existing tests still pass
+- Comprehensive batch SIMD coverage across all similarity metrics and join scenarios
+
+### Phase 10 Dependencies
+- Phase 10 (Tasks 87-91) depends on Phase 9 completion (Tasks 81-86)
+- Task 87 (Hybrid Early Termination) depends on Task 81 (batch SIMD infrastructure)
+- Task 88 (Hamming Batch) depends on Task 81 (batch SIMD infrastructure)
+- Task 89 (Blocking Candidates) depends on Task 52 (blocking) and Task 81 (batch SIMD)
+- Task 90 (AVX-512 Batch) depends on Task 81 (8-wide batch) and Task 84 (AVX-512 individual)
+- Task 91 (Remainder Optimization) depends on Task 81 (batch SIMD infrastructure)
+
+---
+
+## Phase 11: Memory and Dispatch Optimizations for Peak Performance
+
+After Phase 10's comprehensive batch SIMD coverage, this phase implements memory access and dispatch optimizations to match or exceed pl-fuzzy-frame-match performance without using external dependencies like polars-simed.
+
+### Overview
+
+Analysis of pl-fuzzy-frame-match reveals their performance advantages come from:
+1. **Aggressive blocking filtering** (99%+ filter rate at large scales)
+2. **Optimized memory layout** (contiguous string storage, better cache locality)
+3. **Better dispatch logic** (algorithm selection based on batch characteristics)
+4. **Lower overhead** (minimal abstraction layers, aggressive inlining)
+
+Phase 11 addresses these within pure Polars, focusing on:
+- Memory access pattern optimization
+- Better batch-level algorithm dispatch
+- Function call overhead reduction
+- Profile-guided optimization
+
+### High Priority Optimizations
+
+**Task 94: Contiguous Memory Layout for String Batches (HIGH PRIORITY)**
+
+- **Priority:** High
+- **Dependencies:** Task 81 (batch processing infrastructure)
+- **Description:** Use contiguous memory buffers for string pairs to improve cache locality and reduce pointer indirection
+- **Expected Impact:** 10-20% speedup from better cache utilization
+- **Implementation:**
+  - Create `ContiguousStringBatch` struct:
+    ```rust
+    pub struct ContiguousStringBatch {
+        data: Vec<u8>,              // Contiguous buffer for all string data
+        offsets: Vec<usize>,        // Byte offsets for each string
+        indices: Vec<usize>,        // Original row indices
+        lengths: Vec<usize>,        // Pre-computed lengths
+    }
+    ```
+  - Pre-allocate single buffer with estimated total size
+  - Copy string data into contiguous buffer
+  - Benefits:
+    - Sequential memory access improves prefetching
+    - Reduced pointer chasing
+    - Better SIMD memory access patterns
+    - Improved cache line utilization
+  - Use in batch processing paths for both full scan and blocked joins
+  - Add `use_contiguous_layout: bool` parameter (default: true for batches >32 pairs)
+- **Subtasks:**
+  - Subtask 94.1: Implement `ContiguousStringBatch` struct with buffer management
+  - Subtask 94.2: Create `from_string_pairs()` constructor that copies strings contiguously
+  - Subtask 94.3: Update batch SIMD functions to accept contiguous layout
+  - Subtask 94.4: Add memory estimation for optimal buffer pre-allocation
+  - Subtask 94.5: Integrate with `compute_batch_similarities_simd8()`
+  - Subtask 94.6: Add fallback to pointer-based when contiguous layout overhead too high
+  - Subtask 94.7: Benchmark cache miss rates and overall performance improvement
+- **Test Strategy:** Profile cache misses, measure memory access latency, verify correctness
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy.rs`
+
+**Task 95: Batch-Level Algorithm Dispatch (HIGH PRIORITY)**
+
+- **Priority:** High
+- **Dependencies:** None (independent optimization)
+- **Description:** Analyze batch characteristics and select optimal algorithm variant for entire batch instead of per-pair dispatch
+- **Expected Impact:** 15-30% speedup from better algorithm selection and reduced dispatch overhead
+- **Implementation:**
+  - Create `BatchCharacteristics` struct:
+    ```rust
+    pub struct BatchCharacteristics {
+        homogeneous_length: bool,    // All strings same length
+        avg_length: usize,
+        min_length: usize,
+        max_length: usize,
+        all_ascii: bool,
+        high_diversity: bool,        // Many unique characters
+    }
+    ```
+  - Analyze batch once before processing:
+    - Scan all strings in batch for characteristics
+    - Select optimal algorithm variant for entire batch
+    - Avoid per-pair dispatch overhead
+  - Specialized batch paths:
+    - `process_homogeneous_batch()`: All same length (can use optimized loops)
+    - `process_short_batch()`: All strings ≤16 bytes (use inline comparison)
+    - `process_long_batch()`: All strings >50 bytes (use hash-based for Jaro-Winkler)
+    - `process_mixed_batch()`: Mixed lengths (current general path)
+  - Dispatch once per batch instead of once per pair (8-16x fewer dispatch calls)
+- **Subtasks:**
+  - Subtask 95.1: Implement `BatchCharacteristics` analysis
+  - Subtask 95.2: Create specialized batch processing functions
+  - Subtask 95.3: Implement `select_batch_algorithm()` dispatch function
+  - Subtask 95.4: Add homogeneous batch fast path
+  - Subtask 95.5: Integrate batch dispatch with SIMD batch processing
+  - Subtask 95.6: Benchmark dispatch overhead reduction
+- **Test Strategy:** Test on homogeneous and mixed batches, verify algorithm selection, measure speedup
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy.rs`
+
+**Task 96: Aggressive Function Inlining and Call Overhead Reduction (MEDIUM PRIORITY)**
+
+- **Priority:** Medium
+- **Dependencies:** None
+- **Description:** Reduce function call overhead in hot paths through aggressive inlining and flattening
+- **Expected Impact:** 5-15% speedup from reduced call overhead
+- **Implementation:**
+  - Add `#[inline(always)]` to all batch SIMD helper functions
+  - Inline small helper functions into batch processing loops
+  - Use macros for repeated patterns instead of function calls
+  - Flatten call stack in similarity computation:
+    ```rust
+    // ❌ Current: Multiple function calls
+    fn process_batch() {
+        let sim = compute_similarity();  // Call 1
+        filter_results(sim);             // Call 2
+    }
+    
+    // ✅ Optimized: Inline everything
+    #[inline(always)]
+    fn process_batch() {
+        // Inline similarity computation
+        // Inline result filtering
+        // Single function call from caller
+    }
+    ```
+  - Key targets:
+    - `process_simd8_batch()`: Inline similarity computation
+    - `process_remainder_batch()`: Inline individual processing
+    - `compute_batch_similarities_simd8_impl()`: Inline validation checks
+- **Subtasks:**
+  - Subtask 96.1: Add `#[inline(always)]` to batch SIMD helper functions
+  - Subtask 96.2: Inline small helper functions into main loops
+  - Subtask 96.3: Convert repeated patterns to macros
+  - Subtask 96.4: Flatten call stack in hot paths
+  - Subtask 96.5: Profile and verify call overhead reduction
+- **Test Strategy:** Profile call overhead, measure instruction count reduction, verify no code bloat
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy.rs`, `similarity.rs`
+
+### Medium Priority Optimizations
+
+**Task 97: SmallVec for Batch Buffers (MEDIUM PRIORITY)**
+
+- **Priority:** Medium
+- **Dependencies:** Task 94 (contiguous layout)
+- **Description:** Use `SmallVec` for batch buffers to avoid heap allocation for small batches
+- **Expected Impact:** 5-10% speedup for small-medium batch sizes
+- **Implementation:**
+  - Replace `Vec<u8>` with `SmallVec<[u8; 256]>` for small batches
+  - Replace `Vec<(usize, usize, f32)>` with `SmallVec<[(usize, usize, f32); 32]>` for results
+  - Benefits:
+    - Zero heap allocations for batches ≤32 pairs
+    - Faster for common batch sizes
+    - Reduces allocator pressure
+  - Add `smallvec` dependency to `polars-ops/Cargo.toml` (already used elsewhere in Polars)
+  - Use in batch processing and remainder processing
+- **Subtasks:**
+  - Subtask 97.1: Add `smallvec` dependency if not present
+  - Subtask 97.2: Replace batch buffer Vec with SmallVec
+  - Subtask 97.3: Replace result Vec with SmallVec for small batches
+  - Subtask 97.4: Tune SmallVec inline capacity based on profiling
+  - Subtask 97.5: Benchmark allocation overhead reduction
+- **Test Strategy:** Measure allocation counts, verify performance improvement for small batches
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy.rs`
+
+**Task 98: Pre-computed String Length Lookups (MEDIUM PRIORITY)**
+
+- **Priority:** Medium
+- **Dependencies:** Task 94 (contiguous layout)
+- **Description:** Pre-compute and cache string lengths to avoid repeated `str.len()` calls in inner loops
+- **Expected Impact:** 5-10% speedup from eliminated length computations
+- **Implementation:**
+  - Add `lengths` field to `StringBatch` and `ContiguousStringBatch`
+  - Pre-compute all lengths during batch construction
+  - Use cached lengths in:
+    - Length-based pre-filtering
+    - Algorithm dispatch
+    - Similarity computation (where needed)
+  - Single pass through strings instead of multiple `.len()` calls
+  - Particularly beneficial for UTF-8 strings where `.len()` is not O(1) in bytes
+- **Subtasks:**
+  - Subtask 98.1: Add `lengths: Vec<usize>` to batch structs
+  - Subtask 98.2: Pre-compute lengths during batch construction
+  - Subtask 98.3: Update `can_reach_threshold()` to use cached lengths
+  - Subtask 98.4: Update dispatch logic to use cached lengths
+  - Subtask 98.5: Benchmark performance with pre-computed lengths
+- **Test Strategy:** Measure `.len()` call elimination, verify correctness
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy.rs`
+
+**Task 99: Specialized Fast Path for High Thresholds (MEDIUM PRIORITY)**
+
+- **Priority:** Medium
+- **Dependencies:** None
+- **Description:** Add specialized fast paths for high similarity thresholds (≥0.9)
+- **Expected Impact:** 10-30% speedup for high-threshold queries (common use case)
+- **Implementation:**
+  - For thresholds ≥0.9:
+    - Use more aggressive length-based pre-filtering
+    - Check prefix match early (first N characters must match for high similarity)
+    - Use early exit more aggressively
+    - Specialized algorithms that exploit high similarity assumption
+  - Create `*_similarity_high_threshold()` variants:
+    ```rust
+    fn levenshtein_similarity_high_threshold(s1: &[u8], s2: &[u8], threshold: f32) -> Option<f32> {
+        // Assume threshold >= 0.9
+        // Max edit distance = (1 - 0.9) * max_len = 0.1 * max_len
+        // Very narrow diagonal band
+        // Can use faster algorithm
+    }
+    ```
+  - Integrate into batch processing with threshold-based dispatch
+- **Subtasks:**
+  - Subtask 99.1: Implement prefix match check for high thresholds
+  - Subtask 99.2: Create narrow-band Levenshtein for high thresholds
+  - Subtask 99.3: Optimize Jaro-Winkler for high threshold (fewer candidates)
+  - Subtask 99.4: Add threshold-based dispatch in batch processing
+  - Subtask 99.5: Benchmark high-threshold queries
+- **Test Strategy:** Test correctness at various high thresholds, measure speedup
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`, `fuzzy.rs`
+
+### Low Priority Optimizations
+
+**Task 100: Profile-Guided Optimization (PGO) Build Configuration (LOW PRIORITY)**
+
+- **Priority:** Low
+- **Dependencies:** None (build configuration)
+- **Description:** Configure and document PGO builds for optimal performance
+- **Expected Impact:** 10-20% speedup from better branch prediction and code layout
+- **Implementation:**
+  - Document PGO build process in build documentation:
+    ```bash
+    # Step 1: Build with instrumentation
+    RUSTFLAGS="-Cprofile-generate=/tmp/pgo-data" cargo build --release
+    
+    # Step 2: Run representative benchmarks
+    ./target/release/benchmark_fuzzy_join
+    
+    # Step 3: Build with PGO
+    RUSTFLAGS="-Cprofile-use=/tmp/pgo-data -Cllvm-args=-pgo-warn-missing-function" cargo build --release
+    ```
+  - Add PGO configuration to `Cargo.toml`:
+    ```toml
+    [profile.release-pgo]
+    inherits = "release"
+    lto = "fat"
+    codegen-units = 1
+    ```
+  - Create benchmark workload for PGO training that covers:
+    - Various dataset sizes
+    - All similarity metrics
+    - Different threshold ranges
+    - Mix of blocking strategies
+  - Document PGO benefits and when to use
+- **Subtasks:**
+  - Subtask 100.1: Document PGO build process
+  - Subtask 100.2: Create PGO training workload script
+  - Subtask 100.3: Add PGO profile to Cargo.toml
+  - Subtask 100.4: Benchmark PGO vs non-PGO builds
+  - Subtask 100.5: Document when PGO is worth the build time
+- **Test Strategy:** Build with PGO, run benchmarks, measure improvement
+- **Code Location:** Build scripts, `BUILD_OPTIMIZATION.md` documentation
+
+**Task 101: LTO (Link-Time Optimization) Configuration (LOW PRIORITY)**
+
+- **Priority:** Low
+- **Dependencies:** None
+- **Description:** Enable and configure LTO for cross-module optimization
+- **Expected Impact:** 5-15% speedup from better cross-module inlining
+- **Implementation:**
+  - Already enabled in release profile, but document optimal settings:
+    ```toml
+    [profile.release]
+    lto = "fat"          # Full LTO across all crates
+    codegen-units = 1    # Single codegen unit for maximum optimization
+    opt-level = 3        # Maximum optimization level
+    ```
+  - Document trade-offs:
+    - Longer compile times (3-5x slower)
+    - Better runtime performance (5-15% faster)
+    - When to use: production builds, benchmarking
+  - Create separate profile for fast development builds:
+    ```toml
+    [profile.dev-fast]
+    inherits = "dev"
+    opt-level = 1
+    ```
+- **Subtasks:**
+  - Subtask 101.1: Document LTO configuration and trade-offs
+  - Subtask 101.2: Verify LTO is enabled for release builds
+  - Subtask 101.3: Create fast development profile
+  - Subtask 101.4: Benchmark LTO vs non-LTO performance
+- **Test Strategy:** Compare build times and runtime performance with/without LTO
+- **Code Location:** `Cargo.toml`, `BUILD_OPTIMIZATION.md`
+
+### Low Priority Optimizations
+
+**Task 102: Cache Line Alignment for DP Buffers (LOW PRIORITY)**
+
+- **Priority:** Low
+- **Dependencies:** Task 82 (stack allocation)
+- **Description:** Align DP matrix buffers to 64-byte cache lines for optimal memory access
+- **Expected Impact:** 5-10% speedup from reduced cache misses
+- **Implementation:**
+  - Use `#[repr(align(64))]` for buffer structs
+  - Ensure DP row arrays start on cache line boundaries
+  - Benefits:
+    - Each row fits in whole cache lines
+    - Reduced false sharing in parallel execution
+    - Better prefetching
+  - Apply to:
+    - Levenshtein DP buffers
+    - Damerau-Levenshtein DP buffers
+    - Jaro-Winkler match arrays (when on heap)
+- **Subtasks:**
+  - Subtask 102.1: Add cache line alignment to buffer structs
+  - Subtask 102.2: Verify alignment with testing
+  - Subtask 102.3: Profile cache miss rates before/after
+  - Subtask 102.4: Measure performance impact
+- **Test Strategy:** Use perf/cachegrind to measure cache miss reduction
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+**Task 103: Prefetching for Next String Pair (LOW PRIORITY)**
+
+- **Priority:** Low
+- **Dependencies:** Task 94 (contiguous layout)
+- **Description:** Add software prefetching hints for next string pair during current computation
+- **Expected Impact:** 5-10% speedup from improved memory latency hiding
+- **Implementation:**
+  - Use `core::intrinsics::prefetch_read_data()` to prefetch next strings
+  - Prefetch during current similarity computation
+  - Tune prefetch distance based on algorithm complexity
+  - Only enable for large batches (>32 pairs) where benefit exceeds overhead
+  - Target architectures with aggressive prefetchers (x86_64)
+- **Subtasks:**
+  - Subtask 103.1: Add prefetch intrinsics for next string data
+  - Subtask 103.2: Tune prefetch distance based on algorithm
+  - Subtask 103.3: Add architecture-specific prefetch configuration
+  - Subtask 103.4: Benchmark with hardware performance counters
+- **Test Strategy:** Measure memory stall cycles, verify latency hiding
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy.rs`
+
+**Task 104: Compile-Time Optimization Flags (LOW PRIORITY)**
+
+- **Priority:** Low
+- **Dependencies:** None
+- **Description:** Document and optimize RUSTFLAGS for maximum performance
+- **Expected Impact:** 5-10% speedup from better code generation
+- **Implementation:**
+  - Document optimal RUSTFLAGS:
+    ```bash
+    RUSTFLAGS="-C target-cpu=native -C opt-level=3 -C codegen-units=1"
+    ```
+  - Explain each flag:
+    - `target-cpu=native`: Use all CPU features available on build machine
+    - `opt-level=3`: Maximum optimization
+    - `codegen-units=1`: Better optimization at cost of compile time
+  - Add architecture-specific optimizations:
+    - x86_64: Enable AVX-512, AVX2, FMA
+    - ARM: Enable NEON, SVE if available
+  - Create build scripts for different target architectures
+  - Document when to use native vs portable builds
+- **Subtasks:**
+  - Subtask 104.1: Document optimal RUSTFLAGS
+  - Subtask 104.2: Create architecture-specific build scripts
+  - Subtask 104.3: Add target CPU configuration to build guide
+  - Subtask 104.4: Benchmark native vs generic builds
+- **Test Strategy:** Compare performance on different CPUs, verify correctness
+- **Code Location:** `BUILD_OPTIMIZATION.md`, build scripts
+
+### Phase 11 Success Criteria
+- Contiguous memory layout reduces cache misses by 30-50%
+- Batch-level dispatch reduces overhead by 15-30%
+- Function call overhead reduced by 5-15%
+- SmallVec eliminates heap allocations for small batches
+- PGO builds achieve 10-20% additional speedup
+- Overall: 1.5-2.5x additional speedup on top of Phase 10
+- **Target: Match or exceed pl-fuzzy-frame-match on ALL metrics and dataset sizes**
+- All existing tests still pass
+- Performance improvements documented with benchmarks
+
+### Phase 11 Dependencies
+- Phase 11 (Tasks 94-104) can proceed after Phase 10 (Tasks 87-93)
+- Task 94 (Contiguous Layout) depends on Task 81 (batch infrastructure)
+- Task 95 (Batch Dispatch) is independent
+- Task 96 (Inlining) is independent
+- Task 97 (SmallVec) depends on Task 94
+- Task 98 (Length Cache) depends on Task 94
+- Task 99 (High Threshold) is independent
+- Tasks 100-104 are build/configuration tasks (independent)
+
+---
+
+## Phase 12: Novel Optimizations from polars_sim Analysis
+
+After analyzing the `polars_sim` repository (https://github.com/schemaitat/polars_sim), this phase implements novel optimization techniques not yet present in our implementation that could provide alternative approaches or complementary benefits.
+
+### Overview
+
+The `polars_sim` library uses different architectural approaches that offer unique trade-offs:
+1. **On-the-fly vectorization** instead of pre-computed indices
+2. **Integer-based sparse matrices** (u16) for memory efficiency
+3. **Top-N heap-based algorithms** to avoid full matrix materialization
+4. **Dynamic parallelization axis selection** based on DataFrame size asymmetry
+5. **Zero-copy Arrow buffer access** for reduced conversion overhead
+6. **Compile-time SIMD width selection** via feature flags
+7. **Cache-oblivious algorithms** for datasets larger than cache
+8. **Hybrid dense/sparse representation** based on vector density
+
+### Core Alternative Approaches
+
+**Task 105: On-the-Fly Vectorization for Medium Datasets (MEDIUM PRIORITY)**
+
+- **Priority:** Medium
+- **Dependencies:** Task 73 (existing sparse vector blocking)
+- **Description:** Implement streaming sparse vectorization as a lighter-weight alternative to pre-computed indices for medium-sized datasets (100K-1M rows)
+- **Expected Impact:** 10-20% memory reduction, 5-15% speedup for medium datasets where index overhead exceeds lookup benefits
+- **Implementation:**
+  - Create `StreamingVectorizer` that vectorizes strings on-the-fly during similarity computation
+  - Instead of: Build inverted index → Query index → Compute similarities
+  - Do: Stream through right column → Vectorize each string → Sparse dot product
+  - Pre-compute left vectors once, vectorize right strings on-demand
+  - Benefits:
+    - No index building overhead
+    - Lower memory footprint (only left vectors stored)
+    - Better for medium datasets where index building cost > query savings
+    - Simpler implementation for one-time joins
+  - Add `vectorization_mode` parameter:
+    - `"indexed"`: Pre-build inverted index (current approach, best for large datasets)
+    - `"streaming"`: On-the-fly vectorization (best for medium datasets)
+    - `"auto"`: Automatically select based on dataset size and reuse pattern
+- **Subtasks:**
+  - Subtask 105.1: Implement `StreamingVectorizer` struct with on-the-fly n-gram generation
+  - Subtask 105.2: Create `compute_streaming_similarities()` function
+  - Subtask 105.3: Add cost model to choose indexed vs streaming
+  - Subtask 105.4: Integrate with auto-selector based on dataset characteristics
+  - Subtask 105.5: Benchmark indexed vs streaming on medium datasets (100K-1M rows)
+- **Test Strategy:** Compare memory usage and performance vs indexed approach, verify correctness
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy_sparse_vector.rs`
+
+**Task 106: U16 Sparse Matrix Storage for Memory Efficiency (HIGH PRIORITY)**
+
+- **Priority:** High
+- **Dependencies:** Task 73 (sparse vector blocking)
+- **Description:** Use u16 integer storage for sparse vector values when normalization isn't required, reducing memory by 2x and improving cache performance
+- **Expected Impact:** 50% memory reduction, 20-30% speedup from better cache utilization
+- **Implementation:**
+  - Create `SparseVectorStorage` enum:
+    ```rust
+    pub enum SparseVectorStorage {
+        U16 {
+            indices: Vec<u64>,      // N-gram hashes
+            values: Vec<u16>,       // Integer term counts
+            scale_factor: f32,      // For converting back to float
+        },
+        F32 {
+            indices: Vec<u64>,      // N-gram hashes
+            values: Vec<f32>,       // Normalized TF-IDF weights
+        },
+    }
+    ```
+  - Use U16 variant when:
+    - No L2 normalization required
+    - Cosine similarity computed via integer dot product
+    - Convert to f32 only at final step
+  - Benefits:
+    - 2x memory reduction per vector
+    - Better cache line utilization (more vectors fit in cache)
+    - SIMD integer operations on x86 (pmaddwd instruction)
+    - Lower memory bandwidth requirements
+  - Automatically select based on whether normalization is needed
+  - Add `use_integer_storage: bool` parameter (default: auto)
+- **Subtasks:**
+  - Subtask 106.1: Implement `SparseVectorStorage` enum with U16 and F32 variants
+  - Subtask 106.2: Create `dot_product_u16()` for integer dot products
+  - Subtask 106.3: Add SIMD integer dot product using pmaddwd (x86) or similar (ARM)
+  - Subtask 106.4: Implement auto-selection logic based on normalization requirements
+  - Subtask 106.5: Benchmark memory usage and cache performance
+- **Test Strategy:** Verify correctness vs f32 version, measure memory reduction, profile cache misses
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy_sparse_vector.rs`
+
+**Task 107: Top-N Heap-Based Sparse Matrix Multiplication (HIGH PRIORITY)**
+
+- **Priority:** High
+- **Dependencies:** Task 73 (sparse vector implementation)
+- **Description:** Implement specialized sparse matrix multiplication that computes top-N matches per row without materializing the full similarity matrix
+- **Expected Impact:** O(n×m×log(k)) vs O(n×m×log(n×m)) complexity, more memory-efficient for large datasets
+- **Implementation:**
+  - Create `sparse_top_n_per_row()` function:
+    ```rust
+    fn sparse_top_n_per_row(
+        left_vectors: &[SparseVector],
+        right_vectors: &[SparseVector],
+        top_n: usize,
+        threshold: f32,
+    ) -> Vec<Vec<(usize, f32)>> {
+        // Min-heap of size top_n per left row
+        // Only keeps top-N highest similarities
+        // Never materializes full n×m matrix
+    }
+    ```
+  - Use `BinaryHeap` with fixed capacity `top_n` for each left row
+  - Benefits:
+    - Memory usage: O(n × top_n) instead of O(n × m)
+    - Faster for `keep="best"` with small N (e.g., top 1-10 matches)
+    - No need to sort full result set
+    - Cache-friendly (small heaps fit in cache)
+  - Parallel implementation with Rayon for per-row processing
+  - Integrate with existing fuzzy join for `keep="best"` strategy
+- **Subtasks:**
+  - Subtask 107.1: Implement `TopNHeap` struct with min-heap semantics
+  - Subtask 107.2: Create `sparse_top_n_per_row()` function
+  - Subtask 107.3: Add parallel processing with Rayon for rows
+  - Subtask 107.4: Integrate with `compute_fuzzy_matches()` for best match strategy
+  - Subtask 107.5: Benchmark vs full matrix approach for different N values
+- **Test Strategy:** Verify correctness vs full computation, measure memory usage reduction
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy_sparse_vector.rs`
+
+### Parallelization Optimizations
+
+**Task 108: Dynamic Parallelization Axis Selection (MEDIUM PRIORITY)**
+
+- **Priority:** Medium
+- **Dependencies:** Task 55 (parallel fuzzy join)
+- **Description:** Automatically choose whether to parallelize over left or right DataFrame based on size asymmetry and normalization requirements
+- **Expected Impact:** 20-40% speedup for asymmetric joins (one DataFrame >> other)
+- **Implementation:**
+  - Create `ParallelizationAxis` enum:
+    ```rust
+    pub enum ParallelizationAxis {
+        Left,   // Parallelize over left rows (current default)
+        Right,  // Parallelize over right rows (better for right >> left)
+        Auto,   // Automatically select based on characteristics
+    }
+    ```
+  - Selection logic:
+    ```rust
+    fn select_parallelization_axis(
+        left_len: usize,
+        right_len: usize,
+        normalize: bool,
+        blocking_enabled: bool,
+    ) -> ParallelizationAxis {
+        if normalize || blocking_enabled {
+            // Normalization/blocking requires consistent access pattern
+            return ParallelizationAxis::Left;
+        }
+        
+        let size_ratio = right_len as f32 / left_len as f32;
+        
+        if size_ratio > 10.0 {
+            // Right is 10x larger - parallelize over right
+            // Build left index once, query from all right threads
+            ParallelizationAxis::Right
+        } else if size_ratio < 0.1 {
+            // Left is 10x larger - standard left parallelization
+            ParallelizationAxis::Left
+        } else {
+            // Similar sizes - use standard approach
+            ParallelizationAxis::Left
+        }
+    }
+    ```
+  - Implement right-side parallelization:
+    - Build blocking index for left DataFrame once
+    - Parallelize over right rows using Rayon
+    - Each thread queries left index independently
+    - Better load balancing when right >> left
+  - Add `parallelization_axis` parameter (default: "auto")
+- **Subtasks:**
+  - Subtask 108.1: Implement `ParallelizationAxis` enum and selection logic
+  - Subtask 108.2: Create `compute_fuzzy_matches_parallel_right()` function
+  - Subtask 108.3: Build left-side blocking index for right-side parallelization
+  - Subtask 108.4: Integrate with auto-selector based on size ratio
+  - Subtask 108.5: Benchmark on asymmetric datasets (e.g., 100 × 100K, 100K × 100)
+- **Test Strategy:** Test on various size ratios, verify load balancing improvement
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy.rs`
+
+### Memory Access Optimizations
+
+**Task 109: Zero-Copy Arrow String Access (HIGH PRIORITY)**
+
+- **Priority:** High
+- **Dependencies:** Task 94 (contiguous memory layout)
+- **Description:** Access Arrow string buffers directly without conversion overhead, reducing memory copies
+- **Expected Impact:** 10-20% speedup from eliminated string reference conversions
+- **Implementation:**
+  - Create `ArrowStringBatch` struct:
+    ```rust
+    pub struct ArrowStringBatch<'a> {
+        offsets: &'a [i32],          // Arrow offset buffer (direct reference)
+        data: &'a [u8],              // Arrow data buffer (direct reference)
+        null_bitmap: Option<&'a [u8]>, // Arrow null bitmap
+        len: usize,
+    }
+    ```
+  - Implement zero-copy accessors:
+    ```rust
+    #[inline(always)]
+    fn get_unchecked(&self, idx: usize) -> &'a [u8] {
+        let start = self.offsets[idx] as usize;
+        let end = self.offsets[idx + 1] as usize;
+        &self.data[start..end]  // Zero-copy slice
+    }
+    
+    #[inline(always)]
+    fn is_null(&self, idx: usize) -> bool {
+        self.null_bitmap
+            .map(|bitmap| (bitmap[idx / 8] & (1 << (idx % 8))) == 0)
+            .unwrap_or(false)
+    }
+    ```
+  - Benefits:
+    - No intermediate string reference creation
+    - Direct access to Arrow buffers (contiguous memory)
+    - Reduced allocations and copies
+    - Better cache locality
+  - Integrate with batch processing infrastructure
+  - Use in all batch SIMD functions
+- **Subtasks:**
+  - Subtask 109.1: Implement `ArrowStringBatch` struct with zero-copy accessors
+  - Subtask 109.2: Create `from_string_chunked()` constructor
+  - Subtask 109.3: Update batch SIMD functions to accept Arrow batches
+  - Subtask 109.4: Add null handling with bitmap access
+  - Subtask 109.5: Benchmark vs current string reference approach
+- **Test Strategy:** Verify correctness, measure allocation reduction, profile memory bandwidth
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy.rs`
+
+### Build-Time Optimizations
+
+**Task 110: Compile-Time SIMD Width Selection via Feature Flags (LOW PRIORITY)**
+
+- **Priority:** Low
+- **Dependencies:** Task 90 (AVX-512 runtime detection)
+- **Description:** Use compile-time feature flags for SIMD width selection instead of runtime detection for optimal performance
+- **Expected Impact:** 5-10% speedup from eliminated runtime checks and better compiler optimization
+- **Implementation:**
+  - Add feature flags to `Cargo.toml`:
+    ```toml
+    [features]
+    default = ["simd_avx2"]
+    simd_avx2 = []
+    simd_avx512 = []
+    simd_neon = []  # ARM NEON
+    simd_sve = []   # ARM SVE
+    ```
+  - Compile-time SIMD width selection:
+    ```rust
+    #[cfg(all(target_arch = "x86_64", feature = "simd_avx512"))]
+    const SIMD_WIDTH: usize = 16;
+    
+    #[cfg(all(target_arch = "x86_64", feature = "simd_avx2"))]
+    const SIMD_WIDTH: usize = 8;
+    
+    #[cfg(target_arch = "aarch64")]
+    const SIMD_WIDTH: usize = 4;  // NEON is 128-bit
+    ```
+  - Benefits:
+    - Better compiler optimization (constant SIMD width)
+    - No runtime CPU feature detection overhead
+    - Can distribute multiple binaries for different CPUs
+    - Monomorphization enables better inlining
+  - Document build process:
+    ```bash
+    # AVX2 build (default)
+    cargo build --release
+    
+    # AVX-512 build
+    cargo build --release --features simd_avx512
+    
+    # ARM NEON build
+    cargo build --release --target aarch64-unknown-linux-gnu
+    ```
+  - Keep runtime detection as fallback for dynamic library builds
+- **Subtasks:**
+  - Subtask 110.1: Add SIMD feature flags to Cargo.toml
+  - Subtask 110.2: Implement compile-time SIMD width constants
+  - Subtask 110.3: Update batch functions to use compile-time width
+  - Subtask 110.4: Document build process for different SIMD targets
+  - Subtask 110.5: Benchmark compile-time vs runtime dispatch
+- **Test Strategy:** Build with different features, verify correctness, measure overhead reduction
+- **Code Location:** `polars/crates/polars-ops/Cargo.toml`, `similarity.rs`, `fuzzy.rs`
+
+### Advanced Algorithmic Optimizations
+
+**Task 111: Cache-Oblivious Algorithm for Very Large Matrices (LOW PRIORITY)**
+
+- **Priority:** Low
+- **Dependencies:** Task 107 (sparse matrix multiplication)
+- **Description:** Implement recursive cache-oblivious sparse matrix multiplication for datasets that don't fit in cache
+- **Expected Impact:** 15-30% speedup for billion-scale datasets through automatic cache optimization
+- **Implementation:**
+  - Create recursive divide-and-conquer algorithm:
+    ```rust
+    fn sparse_multiply_cache_oblivious(
+        left_start: usize,
+        left_end: usize,
+        right_start: usize,
+        right_end: usize,
+        left_vectors: &[SparseVector],
+        right_vectors: &[SparseVector],
+        threshold: f32,
+    ) -> Vec<(usize, usize, f32)> {
+        let left_size = left_end - left_start;
+        let right_size = right_end - right_start;
+        
+        // Base case: block fits in L3 cache (~1MB = ~1K pairs)
+        if left_size * right_size <= 1024 {
+            return compute_block_direct(left_start, left_end, right_start, right_end, ...);
+        }
+        
+        // Recursive case: divide larger dimension
+        if left_size > right_size {
+            let mid = left_start + left_size / 2;
+            rayon::join(
+                || sparse_multiply_cache_oblivious(left_start, mid, ...),
+                || sparse_multiply_cache_oblivious(mid, left_end, ...),
+            )
+        } else {
+            let mid = right_start + right_size / 2;
+            rayon::join(
+                || sparse_multiply_cache_oblivious(..., right_start, mid, ...),
+                || sparse_multiply_cache_oblivious(..., mid, right_end, ...),
+            )
+        }
+    }
+    ```
+  - Benefits:
+    - Automatic cache optimization for any cache size
+    - Better locality for large datasets (100M+ comparisons)
+    - Natural parallelization via recursive splitting
+    - No manual cache blocking tuning required
+  - Use only for very large datasets where cache misses dominate
+  - Tune base case size based on L3 cache size
+- **Subtasks:**
+  - Subtask 111.1: Implement recursive cache-oblivious algorithm
+  - Subtask 111.2: Add base case direct computation function
+  - Subtask 111.3: Tune base case threshold based on cache size
+  - Subtask 111.4: Integrate with fuzzy join for large datasets
+  - Subtask 111.5: Benchmark on billion-scale datasets (1B+ comparisons)
+- **Test Strategy:** Profile cache misses, measure performance on datasets larger than cache
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy_sparse_vector.rs`
+
+**Task 112: Hybrid Dense/Sparse Vector Representation (MEDIUM PRIORITY)**
+
+- **Priority:** Medium
+- **Dependencies:** Task 106 (U16 storage)
+- **Description:** Automatically switch between dense and sparse vector representations based on vector density
+- **Expected Impact:** 2-3x speedup for high-density vectors (long strings with diverse characters)
+- **Implementation:**
+  - Add `VectorStorage` enum:
+    ```rust
+    pub enum VectorStorage {
+        Sparse {
+            indices: Vec<u64>,
+            values: Vec<u16>,
+        },
+        Dense {
+            values: Vec<u16>,  // Direct index by n-gram hash
+            offset: u64,       // Base offset for indexing
+        },
+    }
+    ```
+  - Density threshold:
+    ```rust
+    fn select_storage(ngrams: &[u64], alphabet_size: u64) -> VectorStorage {
+        const DENSITY_THRESHOLD: f32 = 0.3;  // 30% of possible n-grams
+        
+        let unique_ngrams = ngrams.len();
+        let density = unique_ngrams as f32 / alphabet_size as f32;
+        
+        if density > DENSITY_THRESHOLD || unique_ngrams > 1000 {
+            // Dense representation more efficient
+            // Use direct indexing by n-gram hash
+            VectorStorage::Dense { ... }
+        } else {
+            // Sparse representation
+            VectorStorage::Sparse { ... }
+        }
+    }
+    ```
+  - Benefits:
+    - Dense: O(1) lookup, faster dot product for high-density vectors
+    - Sparse: Lower memory, faster for low-density vectors
+    - Automatic selection eliminates manual tuning
+  - Use dense for:
+    - Very long strings (>100 chars)
+    - High character diversity strings
+    - Multiple language text (Unicode)
+  - Use sparse for:
+    - Short to medium strings (<50 chars)
+    - Limited character set (names, codes, IDs)
+- **Subtasks:**
+  - Subtask 112.1: Implement `VectorStorage` enum with dense and sparse variants
+  - Subtask 112.2: Create density analysis function
+  - Subtask 112.3: Implement dense dot product optimized path
+  - Subtask 112.4: Add auto-selection logic based on density threshold
+  - Subtask 112.5: Benchmark dense vs sparse on various string types
+- **Test Strategy:** Test on high/low density datasets, verify performance crossover point
+- **Code Location:** `polars/crates/polars-ops/src/frame/join/fuzzy_sparse_vector.rs`
+
+### Phase 12 Success Criteria
+- Streaming vectorization provides 10-20% memory reduction for medium datasets
+- U16 sparse storage achieves 50% memory reduction with 20-30% speedup
+- Top-N heap algorithm reduces memory for best-match queries to O(n×k) instead of O(n×m)
+- Dynamic parallelization improves performance 20-40% for asymmetric joins
+- Zero-copy Arrow access reduces overhead by 10-20%
+- Compile-time SIMD selection eliminates 5-10% runtime overhead
+- Cache-oblivious algorithm optimizes billion-scale datasets automatically
+- Hybrid dense/sparse achieves 2-3x speedup for high-density vectors
+- All existing tests still pass
+- New optimizations documented with benchmarks
+
+### Phase 12 Dependencies
+- Phase 12 (Tasks 105-112) can proceed independently after Phase 11
+- Task 105 (Streaming) depends on Task 73 (sparse vector)
+- Task 106 (U16 storage) depends on Task 73 (sparse vector)
+- Task 107 (Top-N heap) depends on Task 73 (sparse vector)
+- Task 108 (Dynamic parallelization) depends on Task 55 (parallel join)
+- Task 109 (Zero-copy Arrow) depends on Task 94 (contiguous layout)
+- Task 110 (Compile-time SIMD) depends on Task 90 (AVX-512)
+- Task 111 (Cache-oblivious) depends on Task 107 (sparse matrix)
+- Task 112 (Hybrid dense/sparse) depends on Task 106 (U16 storage)
+
+---
+
+## Phase 13: Quick Win Optimizations for polars-distance Plugin
+
+After analyzing the polars-distance repository, this phase implements high-impact, low-complexity optimizations that provide immediate performance gains with minimal implementation effort.
+
+### Overview
+
+The polars-distance plugin (https://github.com/ion-elgreco/polars-distance) provides distance metrics for Polars but lacks several key optimizations present in our implementation. This phase ports our optimization techniques to benefit the polars-distance ecosystem.
+
+### High Priority Quick Wins
+
+**Task 113: ARM NEON SIMD Support (CRITICAL PRIORITY)**
+
+- **Priority:** Critical
+- **Dependencies:** None (standalone optimization)
+- **Description:** Port existing AVX2/AVX-512 SIMD code to ARM NEON for Apple Silicon (M1/M2/M3/M4) support
+- **Expected Impact:** 2-4x speedup on Apple Silicon Macs
+- **Target Repository:** polars-distance
+- **Implementation:**
+  - Port x86 SIMD code to ARM NEON intrinsics
+  - Use `#[cfg(target_arch = "aarch64")]` for ARM-specific code
+  - NEON has 128-bit vectors (vs AVX2's 256-bit)
+  - Implement for all distance metrics:
+    - Hamming: `uint8x16_t` for 16-byte XOR + popcount
+    - Levenshtein: `uint32x4_t` for 4-wide min operations
+    - Jaro-Winkler: `uint8x16_t` for character matching
+    - Cosine: `float64x2_t` for 2-wide dot products
+  - Runtime CPU feature detection using `is_aarch64_feature_detected!()`
+  - Fallback to scalar for older ARM without NEON
+- **Subtasks:**
+  - Subtask 113.1: Implement NEON Hamming distance with `vaddvq_u8()` for popcount
+  - Subtask 113.2: Implement NEON Levenshtein with `vminq_u32()` for DP min operations
+  - Subtask 113.3: Implement NEON Jaro-Winkler character search with `vceqq_u8()`
+  - Subtask 113.4: Implement NEON Cosine similarity with `vfmaq_f64()` (FMA)
+  - Subtask 113.5: Add ARM feature detection and dispatch logic
+  - Subtask 113.6: Create CI pipeline for ARM testing (GitHub Actions with M1 runner)
+  - Subtask 113.7: Benchmark on Apple Silicon vs scalar implementation
+- **Test Strategy:** Test on M1/M2 hardware, verify correctness vs x86 results, measure speedup
+- **Documentation:** Add ARM-specific build instructions and performance notes
+
+**Task 114: FMA (Fused Multiply-Add) Instructions (HIGH PRIORITY)**
+
+- **Priority:** High
+- **Dependencies:** None
+- **Description:** Use FMA instructions for floating-point operations to reduce instruction count and improve accuracy
+- **Expected Impact:** 20-40% speedup for cosine similarity, 5-10% for other metrics
+- **Target Repository:** polars-distance
+- **Implementation:**
+  - Replace separate multiply + add with single FMA instruction
+  - Use `.mul_add(b, c)` method for `a * b + c` operations
+  - Apply to:
+    - Cosine similarity: `dot = a.mul_add(b, dot)`
+    - Levenshtein/Jaro min operations: Use FMA for distance calculations
+  - Benefits:
+    - Single instruction instead of two (multiply + add)
+    - Better accuracy (no intermediate rounding)
+    - Available on all modern CPUs (x86: FMA3, ARM: built-in)
+  - Example transformation:
+    ```rust
+    // ❌ Before: Two instructions
+    let result = a * b + c;
+    
+    // ✅ After: One FMA instruction
+    let result = a.mul_add(b, c);
+    ```
+- **Subtasks:**
+  - Subtask 114.1: Replace multiply-add patterns in cosine similarity
+  - Subtask 114.2: Apply FMA to Levenshtein diagonal band min operations
+  - Subtask 114.3: Use FMA in Jaro-Winkler scoring calculations
+  - Subtask 114.4: Add FMA to vector normalization (magnitude calculations)
+  - Subtask 114.5: Benchmark FMA vs separate operations
+- **Test Strategy:** Verify numerical accuracy, measure instruction count reduction
+- **Documentation:** Document FMA usage and benefits in code comments
+
+**Task 115: Profile-Guided Optimization (PGO) Build Configuration (HIGH PRIORITY)**
+
+- **Priority:** High
+- **Dependencies:** None (build configuration)
+- **Description:** Set up and document PGO builds for 10-25% free performance gain
+- **Expected Impact:** 10-25% overall speedup from better branch prediction and code layout
+- **Target Repository:** polars-distance
+- **Implementation:**
+  - Create PGO build profile in `Cargo.toml`:
+    ```toml
+    [profile.release-pgo]
+    inherits = "release"
+    lto = "fat"
+    codegen-units = 1
+    ```
+  - Document three-step PGO process:
+    ```bash
+    # Step 1: Build with instrumentation
+    RUSTFLAGS="-Cprofile-generate=/tmp/pgo-data" cargo build --release
+    
+    # Step 2: Run benchmarks to collect profile
+    cargo bench  # Or run representative workload
+    
+    # Step 3: Rebuild with profile data
+    rustup run nightly bash -c \
+      'RUSTFLAGS="-Cprofile-use=/tmp/pgo-data -Cllvm-args=-pgo-warn-missing-function" \
+       cargo build --release'
+    ```
+  - Create benchmark workload for PGO training:
+    - Various string lengths (short, medium, long)
+    - All distance metrics
+    - Mix of similar and dissimilar strings
+    - Representative of production use
+  - Add CI job for PGO builds
+  - Document when PGO is worth the build time overhead
+- **Subtasks:**
+  - Subtask 115.1: Add PGO profile to Cargo.toml
+  - Subtask 115.2: Create PGO training workload script
+  - Subtask 115.3: Document PGO build process in BUILD.md
+  - Subtask 115.4: Add CI job for PGO builds
+  - Subtask 115.5: Benchmark PGO vs non-PGO performance
+  - Subtask 115.6: Measure compile time overhead vs runtime benefit
+- **Test Strategy:** Compare PGO vs non-PGO builds, verify consistent results
+- **Documentation:** Create `docs/PGO_BUILDS.md` with detailed instructions
+
+**Task 116: Custom Memory Allocator (jemalloc/mimalloc) (MEDIUM PRIORITY)**
+
+- **Priority:** Medium
+- **Dependencies:** None
+- **Description:** Replace system allocator with jemalloc or mimalloc for 5-15% speedup
+- **Expected Impact:** 5-15% speedup from reduced allocation overhead and better memory layout
+- **Target Repository:** polars-distance
+- **Implementation:**
+  - Add allocator dependency to `Cargo.toml`:
+    ```toml
+    [dependencies]
+    mimalloc = { version = "0.1", optional = true }
+    
+    [features]
+    default = ["mimalloc"]
+    mimalloc = ["dep:mimalloc"]
+    ```
+  - In `lib.rs`:
+    ```rust
+    #[cfg(feature = "mimalloc")]
+    #[global_allocator]
+    static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+    ```
+  - Why mimalloc over jemalloc:
+    - Simpler build (no C dependencies)
+    - Better Windows support
+    - Comparable or better performance
+    - Already used in Polars ecosystem
+  - Make it optional via feature flag (default enabled)
+  - Document how to disable if conflicts with other allocators
+- **Subtasks:**
+  - Subtask 116.1: Add mimalloc dependency to Cargo.toml
+  - Subtask 116.2: Set global allocator with feature flag
+  - Subtask 116.3: Test on multiple platforms (Linux, macOS, Windows)
+  - Subtask 116.4: Benchmark vs system allocator
+  - Subtask 116.5: Document allocator selection rationale
+- **Test Strategy:** Verify correctness, measure allocation overhead reduction
+- **Documentation:** Document custom allocator usage and how to opt-out
+
+### Phase 13 Success Criteria
+- ARM NEON provides 2-4x speedup on Apple Silicon
+- FMA instructions provide 20-40% speedup for cosine, 5-10% for others
+- PGO builds provide 10-25% overall speedup
+- Custom allocator provides 5-15% speedup
+- All changes maintain correctness (tests pass)
+- Documentation complete for all optimizations
+- **Combined impact: 50-80% overall performance improvement**
+
+### Phase 13 Dependencies
+- All tasks in Phase 13 are independent and can proceed in parallel
+- Task 113 (ARM NEON) is highest priority due to growing Apple Silicon user base
+- Task 114 (FMA) and Task 115 (PGO) are quick wins with high ROI
+- Task 116 (Allocator) is lowest priority but easiest (one-line change)
+
+---
+
+## Phase 14: Core Performance Optimizations for polars-distance
+
+After Phase 13's quick wins, this phase implements deeper algorithmic and implementation optimizations that require more effort but provide substantial performance gains.
+
+### Overview
+
+These optimizations build on Phase 13 to further improve polars-distance performance through better algorithms, memory access patterns, and SIMD utilization.
+
+### High Priority Core Optimizations
+
+**Task 117: Vectorized Threshold Filtering (CRITICAL PRIORITY)**
+
+- **Priority:** Critical
+- **Dependencies:** Task 113 (SIMD infrastructure)
+- **Description:** Use SIMD for threshold comparisons instead of scalar comparison per pair
+- **Expected Impact:** 20-40% speedup for threshold-based distance queries (common use case)
+- **Target Repository:** polars-distance
+- **Implementation:**
+  - Compute 8 distances with SIMD, then threshold filter in parallel:
+    ```rust
+    // Compute 8 distances using SIMD
+    let distances = compute_batch8_distances(strings);
+    
+    // Vectorized threshold comparison
+    let threshold_vec = f32x8::splat(threshold);
+    let mask = distances.simd_ge(threshold_vec);
+    
+    // Extract only passing distances using bitmask
+    let passing_mask = mask.to_bitmask();
+    for i in 0..8 {
+        if (passing_mask >> i) & 1 != 0 {
+            results.push((indices[i], distances.extract(i)));
+        }
+    }
+    ```
+  - Apply to all distance metrics
+  - Particularly beneficial for filtering scenarios (only keep matches above threshold)
+  - Integrate with existing SIMD distance computation
+- **Subtasks:**
+  - Subtask 117.1: Implement `filter_by_threshold_simd()` for f32x8 vectors
+  - Subtask 117.2: Integrate with Hamming distance computation
+  - Subtask 117.3: Integrate with Levenshtein/Jaro-Winkler distance computation
+  - Subtask 117.4: Add vectorized threshold filtering to batch processing
+  - Subtask 117.5: Benchmark threshold filtering speedup
+- **Test Strategy:** Verify correctness, test at various thresholds, measure speedup
+- **Documentation:** Document vectorized filtering approach
+
+**Task 118: Branchless/Branch-Free Implementations (HIGH PRIORITY)**
+
+- **Priority:** High
+- **Dependencies:** None
+- **Description:** Eliminate conditional branches in hot paths for better CPU pipelining
+- **Expected Impact:** 10-20% speedup from improved branch prediction
+- **Target Repository:** polars-distance
+- **Implementation:**
+  - Replace conditional logic with arithmetic:
+    ```rust
+    // ❌ Branching version
+    let result = if a > b { a } else { b };
+    
+    // ✅ Branchless version
+    let is_greater = (a > b) as u32;
+    let result = (a * is_greater) + (b * (1 - is_greater));
+    
+    // Or use conditional move intrinsic
+    let result = if_then_else(a > b, a, b);  // Maps to CMOV instruction
+    ```
+  - Apply to inner loops of distance calculations:
+    - Levenshtein min operations: `min(a, min(b, c))`
+    - Character comparison: `(ch1 == ch2) as usize`
+    - Hamming difference counting
+  - Use SIMD select operations where possible:
+    ```rust
+    let mask = a.simd_gt(b);
+    let result = mask.select(a, b);  // Branchless SIMD max
+    ```
+  - Focus on hot paths identified by profiling
+- **Subtasks:**
+  - Subtask 118.1: Implement branchless min/max for Levenshtein DP
+  - Subtask 118.2: Branchless character equality checks
+  - Subtask 118.3: Branchless Hamming difference counting
+  - Subtask 118.4: Use SIMD select for conditional operations
+  - Subtask 118.5: Profile branch misprediction reduction
+- **Test Strategy:** Profile branch mispredictions, verify correctness, measure speedup
+- **Documentation:** Add comments explaining branchless techniques
+
+**Task 119: Advanced Multi-Level Prefetching (HIGH PRIORITY)**
+
+- **Priority:** High
+- **Dependencies:** None
+- **Description:** Implement sophisticated prefetching strategy to hide memory latency
+- **Expected Impact:** 10-20% speedup from reduced memory stalls
+- **Target Repository:** polars-distance
+- **Implementation:**
+  - Prefetch multiple strings ahead with different cache levels:
+    ```rust
+    use std::intrinsics::prefetch_read_data;
+    
+    for i in 0..strings.len() {
+        // Prefetch 4 strings ahead into L1 cache
+        if i + 4 < strings.len() {
+            unsafe {
+                prefetch_read_data(
+                    strings[i + 4].as_ptr(),
+                    3  // High temporal locality (L1)
+                );
+            }
+        }
+        
+        // Prefetch 16 strings ahead into L2 cache
+        if i + 16 < strings.len() {
+            unsafe {
+                prefetch_read_data(
+                    strings[i + 16].as_ptr(),
+                    2  // Medium temporal locality (L2)
+                );
+            }
+        }
+        
+        // Compute distance for current string
+        compute_distance(strings[i], target);
+    }
+    ```
+  - Tune prefetch distance based on:
+    - String length (longer = more computation = further prefetch)
+    - Cache sizes (adapt to L1/L2/L3)
+    - Algorithm complexity
+  - Use architecture-specific prefetch instructions:
+    - x86: `_mm_prefetch` with different hints (T0, T1, T2, NTA)
+    - ARM: `__builtin_prefetch`
+  - Measure effectiveness with hardware performance counters
+- **Subtasks:**
+  - Subtask 119.1: Implement multi-level prefetching for string access
+  - Subtask 119.2: Tune prefetch distances based on profiling
+  - Subtask 119.3: Add architecture-specific prefetch intrinsics
+  - Subtask 119.4: Measure cache miss reduction with perf counters
+  - Subtask 119.5: Adaptive prefetch distance based on string length
+- **Test Strategy:** Profile cache misses, measure memory stall cycles, verify benefit
+- **Documentation:** Document prefetching strategy and tuning parameters
+
+### Medium Priority Optimizations
+
+**Task 120: Loop Fusion for Multiple Metrics (MEDIUM PRIORITY)**
+
+- **Priority:** Medium
+- **Dependencies:** None
+- **Description:** Compute multiple distance metrics in single pass for 30-50% speedup when multiple needed
+- **Expected Impact:** 30-50% speedup when computing 2+ metrics on same data
+- **Target Repository:** polars-distance
+- **Implementation:**
+  - Create fused computation functions:
+    ```rust
+    fn compute_levenshtein_and_jaro(s1: &str, s2: &str) -> (f32, f32) {
+        // Share:
+        // - String iteration
+        // - Character comparisons
+        // - Length calculations
+        // Compute both metrics in single pass
+        
+        // Common setup
+        let len1 = s1.len();
+        let len2 = s2.len();
+        let chars1: Vec<char> = s1.chars().collect();
+        let chars2: Vec<char> = s2.chars().collect();
+        
+        // Parallel computation
+        let lev = compute_lev_with_chars(&chars1, &chars2);
+        let jaro = compute_jaro_with_chars(&chars1, &chars2);
+        
+        (lev, jaro)
+    }
+    ```
+  - Common combinations to fuse:
+    - Levenshtein + Jaro-Winkler (both character-based)
+    - Hamming + Levenshtein (when applicable)
+    - Multiple cosine variants (different norms)
+  - Add API for batch metric computation:
+    ```python
+    # Python API
+    df.select([
+        pl.col("name").dist.multi_metric(
+            other,
+            metrics=["levenshtein", "jaro_winkler", "hamming"]
+        )
+    ])
+    ```
+  - Benefit: Amortize string processing overhead across multiple metrics
+- **Subtasks:**
+  - Subtask 120.1: Implement `compute_lev_and_jaro()` fused function
+  - Subtask 120.2: Create generic `compute_multiple_metrics()` API
+  - Subtask 120.3: Add Python bindings for multi-metric computation
+  - Subtask 120.4: Benchmark fused vs separate computation
+  - Subtask 120.5: Document loop fusion benefits and API usage
+- **Test Strategy:** Verify correctness vs separate computation, measure speedup
+- **Documentation:** Add examples for multi-metric use cases
+
+**Task 121: Custom Memory Allocators for Specific Types (MEDIUM PRIORITY)**
+
+- **Priority:** Medium  
+- **Dependencies:** Task 116 (global allocator)
+- **Description:** Use specialized allocators for frequent allocation patterns beyond global allocator
+- **Expected Impact:** Additional 5-10% speedup on top of global allocator improvement
+- **Target Repository:** polars-distance
+- **Implementation:**
+  - Type-specific allocators:
+    - **Arena allocator** for temporary DP matrices (freed in bulk)
+    - **Pool allocator** for fixed-size buffers (reuse without deallocation)
+    - **Stack allocator** for small temporary vectors (<= 128 bytes)
+  - Example arena allocator usage:
+    ```rust
+    struct ArenaAllocator {
+        buffer: Vec<u8>,
+        offset: usize,
+    }
+    
+    impl ArenaAllocator {
+        fn alloc<T>(&mut self, count: usize) -> &mut [T] {
+            // Bump allocator - no individual frees
+            // All freed at once when arena dropped
+        }
+    }
+    
+    fn compute_distance_with_arena(s1: &str, s2: &str) -> f32 {
+        let mut arena = ArenaAllocator::new(1024);
+        let dp = arena.alloc::<u32>(s1.len() * s2.len());
+        // ... computation ...
+        // Arena automatically freed at end of scope
+    }
+    ```
+  - Benefits:
+    - Lower allocation overhead
+    - Better cache locality
+    - Predictable memory layout
+  - Use thread-local allocators to avoid contention
+- **Subtasks:**
+  - Subtask 121.1: Implement arena allocator for DP matrices
+  - Subtask 121.2: Implement pool allocator for fixed-size buffers
+  - Subtask 121.3: Add thread-local allocator support
+  - Subtask 121.4: Integrate specialized allocators with distance functions
+  - Subtask 121.5: Benchmark allocation overhead reduction
+- **Test Strategy:** Measure allocation counts, verify memory safety
+- **Documentation:** Document when to use each allocator type
+
+### Phase 14 Success Criteria
+- Vectorized threshold filtering provides 20-40% speedup for filtered queries
+- Branchless implementations provide 10-20% speedup from better pipelining
+- Advanced prefetching provides 10-20% speedup from hidden latency
+- Loop fusion provides 30-50% speedup for multi-metric scenarios
+- Specialized allocators provide additional 5-10% speedup
+- All optimizations maintain correctness (tests pass)
+- **Combined impact: 30-60% additional performance improvement on top of Phase 13**
+
+### Phase 14 Dependencies
+- Phase 14 (Tasks 117-121) should proceed after Phase 13 completion
+- Task 117 (Vectorized filtering) depends on Task 113 (SIMD infrastructure)
+- Tasks 118, 119, 121 are independent
+- Task 120 (Loop fusion) is independent
+- Task 121 (Specialized allocators) builds on Task 116 (global allocator)
+
+---
+
+## Overall Success Metrics
+
+### Performance Targets (All Phases Complete)
+- **Beat RapidFuzz on ALL metrics:**
+  - Levenshtein: 1.2-2x faster ✅ ACHIEVED (1.24-1.63x)
+  - Damerau-Levenshtein: 1.5-3x faster ✅ ACHIEVED (1.98-2.35x)
+  - Jaro-Winkler: 1.5-6x faster ✅ ACHIEVED (1.19-6.00x)
+  - Hamming: 2-3x faster ✅ ACHIEVED (2.34-2.56x)
+  - Cosine: 20-50x faster ✅ ACHIEVED (15.50-38.68x)
+
+- **Match or exceed pl-fuzzy-frame-match:**
+  - Small datasets (<10M): Match performance ✅ Currently tied
+  - Medium datasets (10-100M): Exceed by 5-10% ⚠️ Close but not consistently faster
+  - Large datasets (100M+): Exceed by 10-20% with Phase 11 optimizations
+  - **Target after Phase 11:** 1.1-1.5x faster across all sizes
+
+### Feature Completeness
+- ✅ All 5 similarity metrics implemented
+- ✅ Full fuzzy join API with all join types
+- ✅ Comprehensive blocking strategies (8 variants)
+- ✅ Batch processing and parallelization
+- ✅ Python bindings complete
+- ✅ 177+ tests all passing
+- ✅ Comprehensive documentation
+
+### Code Quality
+- All code follows Polars patterns and conventions
+- Comprehensive test coverage (unit, integration, edge cases)
+- Clear documentation with examples
+- Performance characteristics documented
+- No external dependencies except standard Polars stack

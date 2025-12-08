@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Polars vs RapidFuzz Similarity Benchmark</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 20px;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #eee;
+            min-height: 100vh;
+        }
+        h1 {
+            color: #00d9ff;
+            text-align: center;
+            margin-bottom: 10px;
+            font-size: 2.5em;
+            text-shadow: 0 0 20px rgba(0, 217, 255, 0.5);
+        }
+        .subtitle {
+            text-align: center;
+            color: #aaa;
+            margin-bottom: 30px;
+            font-size: 1.1em;
+        }
+        .version-info {
+            text-align: center;
+            color: #888;
+            font-size: 0.9em;
+            margin-bottom: 20px;
+        }
+        .metric-section {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 12px;
+            padding: 20px;
+            margin: 20px 0;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        .metric-title {
+            font-size: 1.5em;
+            font-weight: bold;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid;
+        }
+        .metric-levenshtein { border-color: #4ecdc4; color: #4ecdc4; }
+        .metric-damerau_levenshtein { border-color: #ff6b6b; color: #ff6b6b; }
+        .metric-jaro_winkler { border-color: #feca57; color: #feca57; }
+        .metric-hamming { border-color: #a29bfe; color: #a29bfe; }
+        .metric-cosine { border-color: #00d9ff; color: #00d9ff; }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+        th {
+            background: rgba(0, 217, 255, 0.2);
+            padding: 12px;
+            text-align: left;
+            font-weight: 600;
+            border-bottom: 2px solid #00d9ff;
+        }
+        td {
+            padding: 10px 12px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        tr:hover {
+            background: rgba(255, 255, 255, 0.05);
+        }
+        .number {
+            text-align: right;
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
+        }
+        .polars {
+            color: #00ff88;
+            font-weight: bold;
+        }
+        .rapidfuzz {
+            color: #ff6b6b;
+        }
+        .numpy {
+            color: #feca57;
+        }
+        .speedup {
+            font-weight: bold;
+        }
+        .speedup-win {
+            color: #00ff88;
+        }
+        .speedup-lose {
+            color: #ff6b6b;
+        }
+        .dataset-label {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.85em;
+        }
+        .summary {
+            background: linear-gradient(135deg, rgba(0, 217, 255, 0.1), rgba(0, 255, 136, 0.1));
+            border-radius: 12px;
+            padding: 20px;
+            margin: 30px 0;
+            border: 1px solid rgba(0, 217, 255, 0.3);
+        }
+        .summary h2 {
+            color: #00d9ff;
+            margin-bottom: 15px;
+        }
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+        }
+        .summary-card {
+            background: rgba(0, 0, 0, 0.3);
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        .summary-card .value {
+            font-size: 2em;
+            font-weight: bold;
+            color: #00ff88;
+        }
+        .summary-card .label {
+            color: #aaa;
+            font-size: 0.9em;
+        }
+        .legend {
+            display: flex;
+            justify-content: center;
+            gap: 30px;
+            margin: 20px 0;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .legend-color {
+            width: 16px;
+            height: 16px;
+            border-radius: 3px;
+        }
+        .legend-polars { background: #00ff88; }
+        .legend-rapidfuzz { background: #ff6b6b; }
+        .legend-numpy { background: #feca57; }
+    </style>
+</head>
+<body>
+    <h1>🚀 Polars vs RapidFuzz Similarity Benchmark</h1>
+    <div class="subtitle">Direct comparison of string similarity functions + Cosine vector similarity</div>
+    <div class="version-info">Polars version: 1.36.0-beta.1</div>
+    
+    <div class="legend">
+        <div class="legend-item"><div class="legend-color legend-polars"></div><span>Polars</span></div>
+        <div class="legend-item"><div class="legend-color legend-rapidfuzz"></div><span>RapidFuzz</span></div>
+        <div class="legend-item"><div class="legend-color legend-numpy"></div><span>NumPy</span></div>
+    </div>
+
+    <div class="summary">
+        <h2>📊 Overall Summary</h2>
+        <div class="summary-grid">
+            <div class="summary-card">
+                <div class="value">0</div>
+                <div class="label">Benchmark Tests</div>
+            </div>
+            <div class="summary-card">
+                <div class="value">0/0</div>
+                <div class="label">Polars Wins</div>
+            </div>
+            <div class="summary-card">
+                <div class="value">1.00x</div>
+                <div class="label">Avg Speedup</div>
+            </div>
+            <div class="summary-card">
+                <div class="value">1.00x</div>
+                <div class="label">Max Speedup</div>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>

@@ -1,0 +1,80 @@
+{
+  "models": {
+    "main": {
+      "provider": "openai",
+      "modelId": "gpt-4o",
+      "maxTokens": 16384,
+      "temperature": 0.2
+    },
+    "research": {
+      "provider": "openai",
+      "modelId": "gpt-4o-mini-search-preview",
+      "maxTokens": 120000,
+      "temperature": 0.1
+    },
+    "fallback": {
+      "provider": "openai",
+      "modelId": "gpt-4o-mini",
+      "maxTokens": 120000,
+      "temperature": 0.2
+    }
+  },
+  "global": {
+    "logLevel": "info",
+    "debug": false,
+    "defaultNumTasks": 10,
+    "defaultSubtasks": 5,
+    "defaultPriority": "medium",
+    "projectName": "Taskmaster",
+    "ollamaBaseURL": "http://localhost:11434/api",
+    "bedrockBaseURL": "https://bedrock.us-east-1.amazonaws.com",
+    "responseLanguage": "English",
+    "enableCodebaseAnalysis": true,
+    "enableProxy": false,
+    "defaultTag": "master",
+    "azureOpenaiBaseURL": "https://your-endpoint.openai.azure.com/",
+    "userId": "1234567890"
+  },
+  "claudeCode": {},
+  "codexCli": {},
+  "grokCli": {
+    "timeout": 120000,
+    "workingDirectory": null,
+    "defaultModel": "grok-4-latest"
+  },
+  "planner": {
+    "task_rules": {
+      "force_atomic_tasks": true,
+      "avoid_monolithic_tasks": true,
+      "max_hours_per_task": 1,
+      "split_if_estimated_runtime_hours_exceeds": 1,
+      "max_dependencies": 3,
+      "enforce_task_scope_limit": true,
+      "task_scope_limit": "single responsibility",
+      "ban_cross_cutting_tasks": true,
+      "disallow_multi_feature_tasks": true,
+      "ensure_tasks_map_to_single_area_of_code": true,
+      "treat_ui_and_backend_as_separate_concerns": true,
+      "require_acceptance_criteria_per_task": true
+    },
+    "decomposition": {
+      "aggressiveness": "high",
+      "allow_recursive_subtasks": true,
+      "max_recursion_depth": 4,
+      "target_task_size": "small",
+      "split_long_explanations_into_subtasks": true
+    },
+    "task_quality": {
+      "enforce_clarity": true,
+      "require_file_paths_when_possible": true,
+      "require_clear_deliverables": true,
+      "require_test_inclusion_when_relevant": true,
+      "ban_ambiguous_language": true,
+      "ban_multi_step_in_single_task": true
+    },
+    "runnable_tasks": {
+      "default_to_runnable": true,
+      "require_run_instructions_when_applicable": true
+    }
+  }
+}

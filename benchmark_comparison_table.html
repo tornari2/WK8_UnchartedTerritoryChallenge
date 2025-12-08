@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Polars vs pl-fuzzy-frame-match Benchmark Comparison</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 10px;
+        }
+        .subtitle {
+            text-align: center;
+            color: #666;
+            margin-bottom: 30px;
+        }
+        .note {
+            text-align: center;
+            color: #888;
+            font-size: 12px;
+            margin-bottom: 20px;
+        }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 20px auto;
+            background-color: white;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        th {
+            background-color: #2c3e50;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            font-weight: bold;
+            position: sticky;
+            top: 0;
+        }
+        td {
+            padding: 10px;
+            border-bottom: 1px solid #ddd;
+        }
+        tr:nth-child(even) {
+            background-color: #f8f9fa;
+        }
+        tr:hover {
+            background-color: #e8f5e9;
+        }
+        .number {
+            text-align: right;
+            font-family: 'Courier New', monospace;
+        }
+        .polars {
+            color: #4CAF50;
+            font-weight: bold;
+        }
+        .plf {
+            color: #2196F3;
+            font-weight: bold;
+        }
+        .speedup {
+            font-weight: bold;
+        }
+        .speedup-polars {
+            color: #4CAF50;
+        }
+        .speedup-plf {
+            color: #2196F3;
+        }
+        .dataset {
+            font-weight: bold;
+            color: #673AB7;
+        }
+        .section-header {
+            background-color: #34495e !important;
+            color: white !important;
+            font-weight: bold;
+        }
+        .failed {
+            color: #999;
+            font-style: italic;
+        }
+        .failed-row {
+            background-color: #fff3e0 !important;
+        }
+        .precision-high {
+            color: #4CAF50;
+        }
+        .precision-medium {
+            color: #FF9800;
+        }
+        .precision-low {
+            color: #f44336;
+        }
+        .na {
+            color: #999;
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+    <h1>Polars vs pl-fuzzy-frame-match Benchmark Comparison</h1>
+    <div class="subtitle">Performance comparison for Jaro-Winkler, Levenshtein, and Damerau-Levenshtein algorithms</div>
+    <div class="note">
+        Both libraries use the SAME test data and SAME threshold.<br/>
+        pl-fuzzy-frame-match runs in separate venv with ANN (polars-simed) ENABLED.<br/>
+        Precision/Recall computed using Python reference implementations as ground truth (up to 4M comparisons).<br/>
+        pl-fuzzy-frame-match version: 0.3.0<br/>
+        pl-fuzzy Polars version: 1.31.0<br/>
+        Custom Polars version: 1.36.0-beta.1
+    </div>
+    <table>
+        <thead>
+            <tr>
+                <th>Algorithm</th>
+                <th>Dataset Size</th>
+                <th>Comparisons</th>
+                <th>Library</th>
+                <th class="number">Time (s)</th>
+                <th class="number">Throughput (comp/s)</th>
+                <th class="number">Matches</th>
+                <th class="number">Precision</th>
+                <th class="number">Recall</th>
+                <th class="number">Speedup</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr class="section-header"><td colspan="10">Jaro-Winkler</td></tr>
+            <tr>
+                <td></td>
+                <td class="dataset">100 × 100</td>
+                <td class="number">10,000</td>
+                <td class="polars">Polars (custom)</td>
+                <td class="number">0.0098</td>
+                <td class="number">1,021,977</td>
+                <td class="number">40</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number speedup speedup-polars">Polars 5.09x faster</td>
+            </tr>
+            <tr>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td class="plf">pl-fuzzy-frame-match</td>
+                <td class="number">0.0498</td>
+                <td class="number">200,893</td>
+                <td class="number">40</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number precision-high">100.0%</td>
+                <td></td>
+            </tr>
+            <tr>
+                <td></td>
+                <td class="dataset">1,000 × 1,000</td>
+                <td class="number">1,000,000</td>
+                <td class="polars">Polars (custom)</td>
+                <td class="number">0.0430</td>
+                <td class="number">23,246,571</td>
+                <td class="number">395</td>
+                <td class="number precision-high">99.7%</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number speedup speedup-polars">Polars 2.35x faster</td>
+            </tr>
+            <tr>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td class="plf">pl-fuzzy-frame-match</td>
+                <td class="number">0.1011</td>
+                <td class="number">9,891,141</td>
+                <td class="number">391</td>
+                <td class="number precision-high">99.7%</td>
+                <td class="number precision-high">99.0%</td>
+                <td></td>
+            </tr>
+            <tr>
+                <td></td>
+                <td class="dataset">2,000 × 2,000</td>
+                <td class="number">4,000,000</td>
+                <td class="polars">Polars (custom)</td>
+                <td class="number">0.1449</td>
+                <td class="number">27,611,690</td>
+                <td class="number">789</td>
+                <td class="number precision-high">99.1%</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number speedup speedup-polars">Polars 2.54x faster</td>
+            </tr>
+            <tr>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td class="plf">pl-fuzzy-frame-match</td>
+                <td class="number">0.3673</td>
+                <td class="number">10,891,499</td>
+                <td class="number">774</td>
+                <td class="number precision-high">99.5%</td>
+                <td class="number precision-high">98.5%</td>
+                <td></td>
+            </tr>
+            <tr>
+                <td></td>
+                <td class="dataset">4,000 × 4,000</td>
+                <td class="number">16,000,000</td>
+                <td class="polars">Polars (custom)</td>
+                <td class="number">0.3090</td>
+                <td class="number">51,776,933</td>
+                <td class="number">1,567</td>
+                <td class="number na">N/A</td>
+                <td class="number na">N/A</td>
+                <td class="number speedup speedup-polars">Polars 5.26x faster</td>
+            </tr>
+            <tr>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td class="plf">pl-fuzzy-frame-match</td>
+                <td class="number">1.6258</td>
+                <td class="number">9,841,320</td>
+                <td class="number">1,549</td>
+                <td class="number na">N/A</td>
+                <td class="number na">N/A</td>
+                <td></td>
+            </tr>
+            <tr>
+                <td></td>
+                <td class="dataset">10,000 × 10,000</td>
+                <td class="number">100,000,000</td>
+                <td class="polars">Polars (custom)</td>
+                <td class="number">1.9093</td>
+                <td class="number">52,375,167</td>
+                <td class="number">3,926</td>
+                <td class="number na">N/A</td>
+                <td class="number na">N/A</td>
+                <td class="number speedup speedup-polars">Polars 10.94x faster</td>
+            </tr>
+            <tr>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td class="plf">pl-fuzzy-frame-match</td>
+                <td class="number">20.8858</td>
+                <td class="number">4,787,946</td>
+                <td class="number">3,894</td>
+                <td class="number na">N/A</td>
+                <td class="number na">N/A</td>
+                <td></td>
+            </tr>
+            <tr class="section-header"><td colspan="10">Levenshtein</td></tr>
+            <tr>
+                <td></td>
+                <td class="dataset">100 × 100</td>
+                <td class="number">10,000</td>
+                <td class="polars">Polars (custom)</td>
+                <td class="number">0.0060</td>
+                <td class="number">1,669,941</td>
+                <td class="number">39</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number speedup speedup-polars">Polars 7.40x faster</td>
+            </tr>
+            <tr>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td class="plf">pl-fuzzy-frame-match</td>
+                <td class="number">0.0443</td>
+                <td class="number">225,517</td>
+                <td class="number">39</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number precision-high">100.0%</td>
+                <td></td>
+            </tr>
+            <tr>
+                <td></td>
+                <td class="dataset">1,000 × 1,000</td>
+                <td class="number">1,000,000</td>
+                <td class="polars">Polars (custom)</td>
+                <td class="number">0.0215</td>
+                <td class="number">46,569,268</td>
+                <td class="number">382</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number speedup speedup-polars">Polars 6.51x faster</td>
+            </tr>
+            <tr>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td class="plf">pl-fuzzy-frame-match</td>
+                <td class="number">0.1399</td>
+                <td class="number">7,148,392</td>
+                <td class="number">383</td>
+                <td class="number precision-high">99.7%</td>
+                <td class="number precision-high">100.0%</td>
+                <td></td>
+            </tr>
+            <tr>
+                <td></td>
+                <td class="dataset">2,000 × 2,000</td>
+                <td class="number">4,000,000</td>
+                <td class="polars">Polars (custom)</td>
+                <td class="number">0.0628</td>
+                <td class="number">63,647,548</td>
+                <td class="number">769</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number speedup speedup-polars">Polars 5.54x faster</td>
+            </tr>
+            <tr>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td class="plf">pl-fuzzy-frame-match</td>
+                <td class="number">0.3483</td>
+                <td class="number">11,484,228</td>
+                <td class="number">769</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number precision-high">100.0%</td>
+                <td></td>
+            </tr>
+            <tr>
+                <td></td>
+                <td class="dataset">4,000 × 4,000</td>
+                <td class="number">16,000,000</td>
+                <td class="polars">Polars (custom)</td>
+                <td class="number">0.1766</td>
+                <td class="number">90,611,379</td>
+                <td class="number">1,526</td>
+                <td class="number na">N/A</td>
+                <td class="number na">N/A</td>
+                <td class="number speedup speedup-polars">Polars 7.84x faster</td>
+            </tr>
+            <tr>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td class="plf">pl-fuzzy-frame-match</td>
+                <td class="number">1.3841</td>
+                <td class="number">11,560,213</td>
+                <td class="number">1,531</td>
+                <td class="number na">N/A</td>
+                <td class="number na">N/A</td>
+                <td></td>
+            </tr>
+            <tr>
+                <td></td>
+                <td class="dataset">10,000 × 10,000</td>
+                <td class="number">100,000,000</td>
+                <td class="polars">Polars (custom)</td>
+                <td class="number">1.1169</td>
+                <td class="number">89,533,812</td>
+                <td class="number">3,847</td>
+                <td class="number na">N/A</td>
+                <td class="number na">N/A</td>
+                <td class="number speedup speedup-polars">Polars 10.28x faster</td>
+            </tr>
+            <tr>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td class="plf">pl-fuzzy-frame-match</td>
+                <td class="number">11.4794</td>
+                <td class="number">8,711,244</td>
+                <td class="number">3,855</td>
+                <td class="number na">N/A</td>
+                <td class="number na">N/A</td>
+                <td></td>
+            </tr>
+            <tr class="section-header"><td colspan="10">Damerau-Levenshtein</td></tr>
+            <tr>
+                <td></td>
+                <td class="dataset">100 × 100</td>
+                <td class="number">10,000</td>
+                <td class="polars">Polars (custom)</td>
+                <td class="number">0.0270</td>
+                <td class="number">370,045</td>
+                <td class="number">39</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number speedup speedup-polars">Polars 1.74x faster</td>
+            </tr>
+            <tr>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td class="plf">pl-fuzzy-frame-match</td>
+                <td class="number">0.0471</td>
+                <td class="number">212,440</td>
+                <td class="number">39</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number precision-high">100.0%</td>
+                <td></td>
+            </tr>
+            <tr>
+                <td></td>
+                <td class="dataset">1,000 × 1,000</td>
+                <td class="number">1,000,000</td>
+                <td class="polars">Polars (custom)</td>
+                <td class="number">0.1867</td>
+                <td class="number">5,357,148</td>
+                <td class="number">382</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number speedup speedup-polars">Polars 1.39x faster</td>
+            </tr>
+            <tr>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td class="plf">pl-fuzzy-frame-match</td>
+                <td class="number">0.2596</td>
+                <td class="number">3,851,719</td>
+                <td class="number">383</td>
+                <td class="number precision-high">99.7%</td>
+                <td class="number precision-high">100.0%</td>
+                <td></td>
+            </tr>
+            <tr>
+                <td></td>
+                <td class="dataset">2,000 × 2,000</td>
+                <td class="number">4,000,000</td>
+                <td class="polars">Polars (custom)</td>
+                <td class="number">0.6068</td>
+                <td class="number">6,591,950</td>
+                <td class="number">769</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number speedup speedup-polars">Polars 1.93x faster</td>
+            </tr>
+            <tr>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td class="plf">pl-fuzzy-frame-match</td>
+                <td class="number">1.1722</td>
+                <td class="number">3,412,422</td>
+                <td class="number">769</td>
+                <td class="number precision-high">100.0%</td>
+                <td class="number precision-high">100.0%</td>
+                <td></td>
+            </tr>
+            <tr>
+                <td></td>
+                <td class="dataset">4,000 × 4,000</td>
+                <td class="number">16,000,000</td>
+                <td class="polars">Polars (custom)</td>
+                <td class="number">2.5409</td>
+                <td class="number">6,297,072</td>
+                <td class="number">1,526</td>
+                <td class="number na">N/A</td>
+                <td class="number na">N/A</td>
+                <td class="number speedup speedup-polars">Polars 1.88x faster</td>
+            </tr>
+            <tr>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td class="plf">pl-fuzzy-frame-match</td>
+                <td class="number">4.7831</td>
+                <td class="number">3,345,085</td>
+                <td class="number">1,531</td>
+                <td class="number na">N/A</td>
+                <td class="number na">N/A</td>
+                <td></td>
+            </tr>
+            <tr>
+                <td></td>
+                <td class="dataset">10,000 × 10,000</td>
+                <td class="number">100,000,000</td>
+                <td class="polars">Polars (custom)</td>
+                <td class="number">16.7228</td>
+                <td class="number">5,979,867</td>
+                <td class="number">3,847</td>
+                <td class="number na">N/A</td>
+                <td class="number na">N/A</td>
+                <td class="number speedup speedup-polars">Polars 4.38x faster</td>
+            </tr>
+            <tr>
+                <td></td>
+                <td></td>
+                <td></td>
+                <td class="plf">pl-fuzzy-frame-match</td>
+                <td class="number">73.1811</td>
+                <td class="number">1,366,472</td>
+                <td class="number">3,855</td>
+                <td class="number na">N/A</td>
+                <td class="number na">N/A</td>
+                <td></td>
+            </tr>
+        </tbody>
+    </table>
+    
+    <div class="note" style="margin-top: 30px;">
+        <strong>Why is Polars slower on small datasets?</strong><br/>
+        1. <strong>Thread pool overhead</strong>: Polars uses multi-threading (Rayon) which has startup costs not amortized on small data.<br/>
+        2. <strong>pl-fuzzy-frame-match uses ANN</strong>: Approximate Nearest Neighbor indexing is very efficient for small datasets that fit in cache.<br/>
+        3. <strong>Memory allocation</strong>: Polars allocates buffers optimized for large-scale processing.<br/>
+        4. <strong>Polars scales better</strong>: Notice Polars gets relatively faster as dataset size increases (better amortization).
+    </div>
+</body>
+</html>

@@ -1,0 +1,62 @@
+# Build artifacts
+target/
+**/target/
+*.pdb
+
+# Dependencies
+node_modules/
+**/node_modules/
+Cargo.lock
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+ENV/
+
+# Documentation builds
+docs/_build/
+docs/source/_build/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Large data files
+*.csv
+*.parquet
+*.arrow
+examples/datasets/
+
+# Git
+.git/
+
+# Taskmaster state (can be regenerated)
+.taskmaster/state.json
+
+
