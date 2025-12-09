@@ -3209,3 +3209,1950 @@ These optimizations build on Phase 13 to further improve polars-distance perform
 - Clear documentation with examples
 - Performance characteristics documented
 - No external dependencies except standard Polars stack
+
+---
+
+## Phase 15: Advanced SIMD Optimizations for Cosine Similarity and Jaro-Winkler
+
+After analyzing the current implementations, this phase implements missing SIMD optimizations that could provide significant additional speedups for cosine similarity and Jaro-Winkler.
+
+### Overview
+
+Current implementation analysis reveals several optimization opportunities:
+
+**Cosine Similarity (`polars/crates/polars-ops/src/chunked_array/array/similarity.rs`):**
+- ✅ Has ARM NEON, AVX2, AVX-512 support
+- ✅ Has FMA instructions
+- ❌ Uses single accumulator chain (limited ILP)
+- ❌ Always casts f32 embeddings to f64 (wastes throughput)
+- ❌ No batch row processing (one row at a time)
+- ❌ No prefetch hints for large vectors
+
+**Jaro-Winkler (`polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`):**
+- ✅ Has bit-parallel match tracking (≤64 chars)
+- ✅ Has SIMD character search (32 bytes/iteration)
+- ✅ Has column-level ASCII detection
+- ❌ Inner loop in bit-parallel path is scalar (not SIMD)
+- ❌ Transposition counting uses sequential bit scanning
+
+### High Priority Optimizations
+
+**Task 122: Multiple Accumulators for Cosine Similarity ILP (CRITICAL PRIORITY)**
+
+- **Priority:** Critical
+- **Dependencies:** None (enhancement to existing implementation)
+- **Description:** Use 4 independent accumulators to hide FMA latency and achieve better instruction-level parallelism
+- **Expected Impact:** 2-3x speedup for vectors >128 elements
+- **Implementation:**
+  - Current code uses single accumulator chain where each FMA waits for previous:
+    ```rust
+    // ❌ Current: single accumulator chain
+    for i in 0..chunks {
+        dot_acc = va.mul_add(vb, dot_acc);  // Each FMA waits for previous
+    }
+    ```
+  - Use 4 independent accumulators that can execute in parallel:
+    ```rust
+    // ✅ Optimized: 4 independent accumulators (2-3x faster for long vectors)
+    let (mut dot0, mut dot1, mut dot2, mut dot3) = (splat(0.0), splat(0.0), splat(0.0), splat(0.0));
+    let (mut norm_a0, mut norm_a1, mut norm_a2, mut norm_a3) = (splat(0.0), splat(0.0), splat(0.0), splat(0.0));
+    let (mut norm_b0, mut norm_b1, mut norm_b2, mut norm_b3) = (splat(0.0), splat(0.0), splat(0.0), splat(0.0));
+
+    for i in (0..chunks).step_by(4) {
+        let va0 = load(&a[i*W..]);
+        let va1 = load(&a[(i+1)*W..]);
+        let va2 = load(&a[(i+2)*W..]);
+        let va3 = load(&a[(i+3)*W..]);
+        let vb0 = load(&b[i*W..]);
+        let vb1 = load(&b[(i+1)*W..]);
+        let vb2 = load(&b[(i+2)*W..]);
+        let vb3 = load(&b[(i+3)*W..]);
+        
+        // These 4 FMAs can execute in parallel on modern CPUs
+        dot0 = va0.mul_add(vb0, dot0);
+        dot1 = va1.mul_add(vb1, dot1);
+        dot2 = va2.mul_add(vb2, dot2);
+        dot3 = va3.mul_add(vb3, dot3);
+        
+        norm_a0 = va0.mul_add(va0, norm_a0);
+        norm_a1 = va1.mul_add(va1, norm_a1);
+        norm_a2 = va2.mul_add(va2, norm_a2);
+        norm_a3 = va3.mul_add(va3, norm_a3);
+        
+        norm_b0 = vb0.mul_add(vb0, norm_b0);
+        norm_b1 = vb1.mul_add(vb1, norm_b1);
+        norm_b2 = vb2.mul_add(vb2, norm_b2);
+        norm_b3 = vb3.mul_add(vb3, norm_b3);
+    }
+    
+    // Reduce at the end (single reduction)
+    let dot = (dot0 + dot1) + (dot2 + dot3);
+    let norm_a_sq = (norm_a0 + norm_a1) + (norm_a2 + norm_a3);
+    let norm_b_sq = (norm_b0 + norm_b1) + (norm_b2 + norm_b3);
+    ```
+  - FMA latency is 4-5 cycles, but throughput is 2 per cycle on modern CPUs
+  - 4 accumulators allow full utilization of FMA units
+  - Apply to all architecture paths: AVX2, AVX-512, NEON
+- **Subtasks:**
+  - Subtask 122.1: Implement 4-accumulator version of `dot_product_and_norms_avx2_fma()`
+  - Subtask 122.2: Implement 4-accumulator version of `dot_product_and_norms_avx512()`
+  - Subtask 122.3: Implement 4-accumulator version of `dot_product_and_norms_neon()`
+  - Subtask 122.4: Add handling for vectors not divisible by 4*SIMD_WIDTH
+  - Subtask 122.5: Benchmark single vs 4-accumulator on various vector sizes
+- **Test Strategy:** Verify numerical correctness, benchmark on vectors 64-4096 elements
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/array/similarity.rs`
+
+**Task 123: Direct f32 SIMD Path for Embeddings (HIGH PRIORITY)**
+
+- **Priority:** High
+- **Dependencies:** Task 122 (applies same multi-accumulator technique)
+- **Description:** Add direct f32 SIMD path to avoid f64 casting overhead for embedding vectors
+- **Expected Impact:** 2x speedup for f32 embedding vectors (common in ML)
+- **Implementation:**
+  - Currently all inputs are cast to f64, wasting half of SIMD throughput:
+    ```rust
+    // ❌ Current: always cast to f64
+    let a_f64 = a.cast(&DataType::Float64).ok()?;
+    ```
+  - Add direct f32 path using f32x8 (AVX2) or f32x16 (AVX-512):
+    ```rust
+    // ✅ Optimized: detect f32 and use native SIMD
+    if a.dtype() == &DataType::Float32 && b.dtype() == &DataType::Float32 {
+        return cosine_similarity_f32(a, b);
+    }
+    
+    fn dot_product_and_norms_f32_avx2(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+        const SIMD_WIDTH: usize = 8;  // f32x8 for AVX2 (vs f64x4)
+        type SimdF32 = Simd<f32, SIMD_WIDTH>;
+        
+        // Process 8 floats per iteration instead of 4 doubles
+        // Double throughput for f32 embeddings
+    }
+    
+    fn dot_product_and_norms_f32_avx512(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+        const SIMD_WIDTH: usize = 16;  // f32x16 for AVX-512
+        type SimdF32 = Simd<f32, SIMD_WIDTH>;
+        // Process 16 floats per iteration
+    }
+    ```
+  - f32 is sufficient precision for most ML embeddings
+  - Most embedding models (BERT, GPT, etc.) output f32
+- **Subtasks:**
+  - Subtask 123.1: Implement `dot_product_and_norms_f32_avx2()` with f32x8 vectors
+  - Subtask 123.2: Implement `dot_product_and_norms_f32_avx512()` with f32x16 vectors
+  - Subtask 123.3: Implement `dot_product_and_norms_f32_neon()` with f32x4 vectors
+  - Subtask 123.4: Add dtype detection in `compute_cosine_similarity()` to choose path
+  - Subtask 123.5: Benchmark f32 native vs f64 cast on typical embedding sizes (384, 768, 1536)
+- **Test Strategy:** Verify numerical accuracy is sufficient for similarity, benchmark vs f64 path
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/array/similarity.rs`
+
+**Task 124: SIMD Inner Loop for Jaro-Winkler Bit-Parallel Path (HIGH PRIORITY)**
+
+- **Priority:** High
+- **Dependencies:** None (enhancement to existing implementation)
+- **Description:** Vectorize the character search inner loop in `jaro_similarity_bitparallel()` which currently uses scalar comparison
+- **Expected Impact:** 30-50% speedup for strings 32-64 characters
+- **Implementation:**
+  - Current scalar inner loop:
+    ```rust
+    // ❌ Current: scalar inner loop
+    for j in start..end {
+        if (s2_matches & (1u64 << j)) == 0 && s2[j] == needle {
+            s1_matches |= 1u64 << i;
+            s2_matches |= 1u64 << j;
+            matches += 1;
+            break;
+        }
+    }
+    ```
+  - SIMD-accelerated character search with bitmask check:
+    ```rust
+    // ✅ Optimized: SIMD character search with bit mask check
+    fn find_unmatched_char_simd(
+        needle: u8, 
+        s2: &[u8], 
+        start: usize, 
+        end: usize, 
+        s2_matches: u64
+    ) -> Option<usize> {
+        const W: usize = 32;
+        type SimdU8 = Simd<u8, W>;
+        
+        let needle_vec = SimdU8::splat(needle);
+        let search_slice = &s2[start..end.min(s2.len())];
+        
+        for chunk_start in (0..search_slice.len()).step_by(W) {
+            let chunk_end = (chunk_start + W).min(search_slice.len());
+            if chunk_end - chunk_start < W { break; } // Handle remainder scalar
+            
+            let haystack = SimdU8::from_slice(&search_slice[chunk_start..chunk_start + W]);
+            let eq_mask = haystack.simd_eq(needle_vec).to_bitmask();
+            
+            if eq_mask != 0 {
+                // Extract positions where s2[j] == needle AND !already_matched
+                let base_pos = start + chunk_start;
+                let unmatched_mask = if base_pos + W <= 64 {
+                    !((s2_matches >> base_pos) as u32) // Extract relevant bits
+                } else {
+                    u32::MAX // All positions are "unmatched" for positions > 64
+                };
+                
+                let combined = eq_mask as u32 & unmatched_mask;
+                if combined != 0 {
+                    return Some(base_pos + combined.trailing_zeros() as usize);
+                }
+            }
+        }
+        
+        // Scalar fallback for remainder
+        for j in (start + (search_slice.len() / W) * W)..end {
+            if (s2_matches & (1u64 << j)) == 0 && s2[j] == needle {
+                return Some(j);
+            }
+        }
+        None
+    }
+    ```
+  - Key insight: Current bit-parallel uses u64 bitmasks for match tracking but scalar search
+  - SIMD search finds character positions fast, then check against match bitmask
+- **Subtasks:**
+  - Subtask 124.1: Implement `find_unmatched_char_simd()` helper function
+  - Subtask 124.2: Integrate SIMD search into `jaro_similarity_bitparallel()` match-finding loop
+  - Subtask 124.3: Handle edge cases: search window crossing 32-byte boundaries
+  - Subtask 124.4: Optimize for common case where needle found in first SIMD chunk
+  - Subtask 124.5: Benchmark bit-parallel with SIMD search vs scalar search
+- **Test Strategy:** Verify correctness on strings 32-64 chars, benchmark speedup
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+**Task 125: Fast Transposition Counting with Popcount (HIGH PRIORITY)**
+
+- **Priority:** High
+- **Dependencies:** Task 124 (both optimize bit-parallel path)
+- **Description:** Optimize transposition counting using efficient bit manipulation instead of sequential iteration
+- **Expected Impact:** 10-20% speedup for bit-parallel path
+- **Implementation:**
+  - Current sequential bit scanning:
+    ```rust
+    // ❌ Current: sequential bit scanning
+    for i in 0..len1 {
+        if (s1_matches & (1u64 << i)) == 0 { continue; }
+        // find next match in s2_matches...
+    }
+    ```
+  - Optimized using `trailing_zeros()` to skip directly to set bits:
+    ```rust
+    // ✅ Optimized: iterate only through set bits
+    fn count_transpositions_fast(s1: &[u8], s2: &[u8], s1_matches: u64, s2_matches: u64) -> u32 {
+        let mut trans = 0u32;
+        let mut remaining_s2 = s2_matches;
+        
+        // Iterate only through set bits (skip zeros efficiently)
+        let mut s1_bits = s1_matches;
+        while s1_bits != 0 {
+            let i = s1_bits.trailing_zeros() as usize;
+            s1_bits &= s1_bits - 1; // Clear lowest set bit (Kernighan's algorithm)
+            
+            // Find lowest set bit in remaining_s2
+            let j = remaining_s2.trailing_zeros() as usize;
+            remaining_s2 &= remaining_s2 - 1; // Clear lowest set bit
+            
+            // Branchless comparison
+            trans += (s1[i] != s2[j]) as u32;
+        }
+        trans / 2
+    }
+    ```
+  - Key optimizations:
+    - `trailing_zeros()` is a single CPU instruction (TZCNT/CTZ)
+    - `x &= x - 1` clears lowest bit in single instruction
+    - Branchless transposition increment
+    - Only iterates through matched positions (typically ~30% of string length)
+- **Subtasks:**
+  - Subtask 125.1: Implement `count_transpositions_fast()` with bit manipulation
+  - Subtask 125.2: Replace existing transposition counting in `jaro_similarity_bitparallel()`
+  - Subtask 125.3: Add unit tests for edge cases (all matches, no matches, single match)
+  - Subtask 125.4: Benchmark transposition counting speedup in isolation
+  - Subtask 125.5: Measure overall Jaro-Winkler improvement
+- **Test Strategy:** Verify transposition counts match existing implementation, benchmark
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+### Medium Priority Optimizations
+
+**Task 126: Batch Row Processing for Cosine Similarity (MEDIUM PRIORITY)**
+
+- **Priority:** Medium
+- **Dependencies:** Task 122, Task 123
+- **Description:** Process multiple row pairs simultaneously to amortize overhead and improve memory bandwidth utilization
+- **Expected Impact:** 20-40% speedup for large DataFrame operations
+- **Implementation:**
+  - Current: Process one row pair at a time
+  - Optimized: Process 4 row pairs simultaneously:
+    ```rust
+    fn cosine_similarity_batch_4(
+        a_rows: [&[f64]; 4],
+        b_rows: [&[f64]; 4],
+    ) -> [f64; 4] {
+        // Interleave loads from all 4 pairs for better memory bandwidth
+        // Compute 4 similarities with shared loop overhead
+        
+        let mut dots = [0.0; 4];
+        let mut norms_a = [0.0; 4];
+        let mut norms_b = [0.0; 4];
+        
+        // Assuming all rows same length
+        let len = a_rows[0].len();
+        
+        for i in 0..len {
+            // Load 4 values from each row (memory streaming)
+            let a0 = a_rows[0][i];
+            let a1 = a_rows[1][i];
+            let a2 = a_rows[2][i];
+            let a3 = a_rows[3][i];
+            let b0 = b_rows[0][i];
+            let b1 = b_rows[1][i];
+            let b2 = b_rows[2][i];
+            let b3 = b_rows[3][i];
+            
+            // Parallel accumulation
+            dots[0] += a0 * b0;
+            dots[1] += a1 * b1;
+            dots[2] += a2 * b2;
+            dots[3] += a3 * b3;
+            
+            norms_a[0] += a0 * a0;
+            norms_a[1] += a1 * a1;
+            // ... etc
+        }
+        
+        // Compute final similarities
+        [
+            dots[0] / (norms_a[0].sqrt() * norms_b[0].sqrt()),
+            dots[1] / (norms_a[1].sqrt() * norms_b[1].sqrt()),
+            dots[2] / (norms_a[2].sqrt() * norms_b[2].sqrt()),
+            dots[3] / (norms_a[3].sqrt() * norms_b[3].sqrt()),
+        ]
+    }
+    ```
+  - Benefits:
+    - Amortize loop overhead across 4 rows
+    - Better memory bandwidth utilization
+    - Can use SIMD across rows instead of within rows
+- **Subtasks:**
+  - Subtask 126.1: Implement `cosine_similarity_batch_4()` function
+  - Subtask 126.2: Update `cosine_similarity_arr()` to use batch processing
+  - Subtask 126.3: Handle remainder rows (1-3 rows) efficiently
+  - Subtask 126.4: Add SIMD acceleration across rows using f64x4
+  - Subtask 126.5: Benchmark batch vs individual row processing
+- **Test Strategy:** Verify correctness, benchmark on 1K-100K rows
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/array/similarity.rs`
+
+**Task 127: Prefetch Hints for Large Vectors (MEDIUM PRIORITY)**
+
+- **Priority:** Medium
+- **Dependencies:** None
+- **Description:** Add software prefetch hints for upcoming data in cosine similarity hot loops
+- **Expected Impact:** 10-15% speedup for large vectors with cache misses
+- **Implementation:**
+  - Add prefetch intrinsics to SIMD loops:
+    ```rust
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+    
+    fn dot_product_and_norms_with_prefetch(a: &[f64], b: &[f64]) -> (f64, f64, f64) {
+        const SIMD_WIDTH: usize = 4;
+        const PREFETCH_DISTANCE: usize = 8; // Prefetch 8 chunks ahead
+        
+        for i in 0..chunks {
+            // Prefetch data for iteration i+PREFETCH_DISTANCE while computing i
+            if i + PREFETCH_DISTANCE < chunks {
+                let prefetch_offset = (i + PREFETCH_DISTANCE) * SIMD_WIDTH;
+                unsafe {
+                    _mm_prefetch(
+                        a.as_ptr().add(prefetch_offset) as *const i8, 
+                        _MM_HINT_T0  // Prefetch to L1 cache
+                    );
+                    _mm_prefetch(
+                        b.as_ptr().add(prefetch_offset) as *const i8, 
+                        _MM_HINT_T0
+                    );
+                }
+            }
+            
+            // Compute current iteration
+            let offset = i * SIMD_WIDTH;
+            let va = SimdF64::from_slice(&a[offset..offset + SIMD_WIDTH]);
+            let vb = SimdF64::from_slice(&b[offset..offset + SIMD_WIDTH]);
+            // ... accumulation
+        }
+    }
+    ```
+  - Tune prefetch distance based on:
+    - Cache line size (64 bytes)
+    - Computation latency per iteration
+    - Memory latency (~100 cycles)
+  - Add ARM-specific prefetch for NEON path
+- **Subtasks:**
+  - Subtask 127.1: Add prefetch intrinsics to `dot_product_and_norms_avx2_fma()`
+  - Subtask 127.2: Add prefetch intrinsics to `dot_product_and_norms_avx512()`
+  - Subtask 127.3: Add prefetch intrinsics to `dot_product_and_norms_neon()`
+  - Subtask 127.4: Tune prefetch distance based on profiling
+  - Subtask 127.5: Benchmark with hardware performance counters (cache misses)
+- **Test Strategy:** Use perf to measure cache miss reduction, verify speedup
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/array/similarity.rs`
+
+**Task 128: Pre-Normalized Vector Fast Path (MEDIUM PRIORITY)**
+
+- **Priority:** Medium
+- **Dependencies:** None
+- **Description:** Add optimized path for pre-normalized vectors where cosine = dot product
+- **Expected Impact:** ~33% speedup for pre-normalized embeddings (skip norm computation)
+- **Implementation:**
+  - Many ML embeddings are already L2-normalized (unit vectors)
+  - For normalized vectors: cosine_similarity = dot_product
+  - Add parameter to indicate pre-normalized:
+    ```rust
+    pub fn cosine_similarity_arr_normalized(
+        ca: &ArrayChunked, 
+        other: &ArrayChunked,
+        normalized: bool,  // If true, assume unit vectors
+    ) -> PolarsResult<Float64Chunked> {
+        if normalized {
+            // Fast path: just compute dot product
+            return dot_product_arr(ca, other);
+        }
+        // Regular path with norm computation
+        cosine_similarity_arr(ca, other)
+    }
+    
+    fn dot_product_simd(a: &[f64], b: &[f64]) -> f64 {
+        // Only compute dot product, skip norm calculations
+        // 1/3 of the FLOPs of full cosine similarity
+    }
+    ```
+  - Add Python API:
+    ```python
+    df.select(
+        pl.col("embedding").arr.cosine_similarity(other, normalized=True)
+    )
+    ```
+- **Subtasks:**
+  - Subtask 128.1: Implement `dot_product_simd()` for f64 vectors
+  - Subtask 128.2: Implement `dot_product_simd_f32()` for f32 vectors
+  - Subtask 128.3: Add `normalized` parameter to `cosine_similarity_arr()`
+  - Subtask 128.4: Update Python bindings to expose `normalized` parameter
+  - Subtask 128.5: Add documentation explaining when to use normalized=True
+- **Test Strategy:** Verify results match full computation for unit vectors, benchmark 33% speedup
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/array/similarity.rs`
+
+### Phase 15 Success Criteria
+- Multiple accumulators provide 2-3x speedup for large vectors (>128 elements)
+- Direct f32 path provides 2x speedup for f32 embeddings
+- SIMD inner loop provides 30-50% speedup for 32-64 char strings
+- Fast transposition counting provides 10-20% speedup for bit-parallel path
+- Batch row processing provides 20-40% speedup for DataFrame operations
+- Prefetch hints provide 10-15% speedup for large vectors
+- Pre-normalized path provides 33% speedup for unit vectors
+- All optimizations maintain correctness (all tests pass)
+- **Combined impact: 2-4x additional speedup for cosine, 30-50% for Jaro-Winkler**
+
+### Phase 15 Dependencies
+- Phase 15 (Tasks 122-128) can proceed after Phase 14
+- Task 122 (Multiple Accumulators) is independent
+- Task 123 (f32 Path) can use techniques from Task 122
+- Task 124 (SIMD Inner Loop) is independent
+- Task 125 (Fast Transposition) depends on Task 124 (both optimize bit-parallel)
+- Task 126 (Batch Rows) depends on Tasks 122, 123
+- Task 127 (Prefetch) is independent
+- Task 128 (Pre-Normalized) is independent
+
+---
+
+## Phase 16: Critical Gap Closure for Lagging Metrics
+
+After Phase 15's SIMD optimizations, this phase addresses the fundamental algorithmic gaps causing Damerau-Levenshtein and Jaro-Winkler to lag behind RapidFuzz at scale.
+
+### Overview
+
+Current benchmark analysis reveals critical optimization gaps:
+
+**Damerau-Levenshtein (RapidFuzz 1.4-1.8x faster):**
+- ❌ **No Myers' Bit-Parallel**: RapidFuzz uses bit-parallel for short strings
+- ❌ **No Diagonal Band**: This is what makes Levenshtein fast - DL doesn't have it!
+- ⚠️ **Transposition dependency breaks SIMD**: The `prev_prev_row[i-2] + 1` check creates data dependency
+
+**Jaro-Winkler (RapidFuzz 1.3-2.7x faster at scale):**
+- ⚠️ **Core matching loop is scalar**: SIMD only used for auxiliary operations
+- ❌ **No bit-parallel for >64 chars**: Falls back to hash-based which is slower
+- ⚠️ **O(n²) match window iteration**: Quadratic behavior for long strings
+
+### Critical Damerau-Levenshtein Optimizations
+
+**Task 129: Myers' Bit-Parallel for Damerau-Levenshtein (CRITICAL PRIORITY)**
+
+- **Priority:** Critical
+- **Dependencies:** None (standalone optimization)
+- **Description:** Implement Myers' bit-parallel algorithm for Damerau-Levenshtein on short strings (≤64 chars), matching what RapidFuzz does
+- **Expected Impact:** 2-3x speedup for short strings (the majority of real-world data)
+- **Root Cause:** Current DL uses O(m×n) DP even for short strings where bit-parallel is much faster
+- **Implementation:**
+  - Extend Myers' bit-parallel to handle transpositions
+  - Key insight: Track transposition positions with an additional bitmask
+  - Algorithm outline:
+    ```rust
+    fn damerau_levenshtein_myers(s1: &[u8], s2: &[u8]) -> usize {
+        // Standard Myers setup
+        let mut pv: u64 = !0;  // Positive vertical delta
+        let mut mv: u64 = 0;   // Negative vertical delta
+        let mut score = s1.len();
+        
+        // Character position bitmasks (same as Myers)
+        let mut peq = [0u64; 256];
+        for (i, &c) in s1.iter().enumerate() {
+            peq[c as usize] |= 1 << i;
+        }
+        
+        // Track previous character for transposition detection
+        let mut prev_char = 0u8;
+        let mut prev_eq = 0u64;
+        
+        for (j, &c) in s2.iter().enumerate() {
+            let eq = peq[c as usize];
+            
+            // Standard Myers bit operations
+            let xv = eq | mv;
+            let xh = ((eq & pv).wrapping_add(pv)) ^ pv | eq;
+            let ph = mv | !(xh | pv);
+            let mh = pv & xh;
+            
+            // Transposition check: if current char matches position j-1 in s1
+            // AND previous char matches position j in s1
+            if j > 0 {
+                let trans_possible = (prev_eq >> 1) & eq;
+                // Adjust score if transposition is cheaper
+                // This is the key extension over standard Myers
+            }
+            
+            // Update score and vectors
+            score = score.wrapping_add(((ph >> (s1.len() - 1)) & 1) as usize);
+            score = score.wrapping_sub(((mh >> (s1.len() - 1)) & 1) as usize);
+            
+            // Shift for next iteration
+            pv = (mh << 1) | !(xv | (ph << 1));
+            mv = (ph << 1) & xv;
+            
+            prev_char = c;
+            prev_eq = eq;
+        }
+        
+        score
+    }
+    ```
+  - Integrate into `damerau_levenshtein_distance_bytes()` dispatch:
+    - Use Myers for strings ≤64 chars (single u64 word)
+    - Fall back to existing SIMD DP for longer strings
+- **Subtasks:**
+  - Subtask 129.1: Implement core `damerau_levenshtein_myers()` function
+  - Subtask 129.2: Add transposition tracking bitmask logic
+  - Subtask 129.3: Integrate into main dispatch in `damerau_levenshtein_distance_bytes()`
+  - Subtask 129.4: Add unit tests comparing against existing implementation
+  - Subtask 129.5: Benchmark Myers vs DP for strings 10-64 chars
+- **Test Strategy:** Verify correctness against existing implementation, benchmark on short strings
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+**Task 130: Diagonal Band Optimization for Damerau-Levenshtein (CRITICAL PRIORITY)**
+
+- **Priority:** Critical
+- **Dependencies:** None
+- **Description:** Implement diagonal band algorithm for Damerau-Levenshtein to reduce complexity from O(m×n) to O(m×k) where k is the band width
+- **Expected Impact:** 5-10x speedup for medium-long strings (this is the #1 missing optimization!)
+- **Root Cause:** Current DL computes full O(m×n) matrix; Levenshtein's diagonal band gives it a huge advantage
+- **Implementation:**
+  - Similar to `levenshtein_distance_adaptive_band()` but with transposition handling
+  - Key challenge: Transposition check looks at `prev_prev_row[i-2]` which may be outside the band
+  - Solution: Extend band by 1 on each side to accommodate transposition check
+  - Algorithm outline:
+    ```rust
+    fn damerau_levenshtein_distance_banded(s1: &[u8], s2: &[u8], max_distance: usize) -> Option<usize> {
+        let m = s1.len();
+        let n = s2.len();
+        
+        // Length difference check
+        if m.abs_diff(n) > max_distance {
+            return None;
+        }
+        
+        // Band width = max_distance + 1 (extended for transposition)
+        let band_width = max_distance + 2;  // +2 for transposition lookahead
+        
+        // Use 3 rows for DL (prev_prev, prev, curr)
+        let mut prev_prev_row = vec![u32::MAX; band_width * 2 + 3];
+        let mut prev_row = vec![u32::MAX; band_width * 2 + 3];
+        let mut curr_row = vec![u32::MAX; band_width * 2 + 3];
+        
+        // Initialize first row within band
+        for k in 0..=band_width.min(n) {
+            prev_row[k] = k as u32;
+        }
+        
+        for i in 1..=m {
+            // Compute band boundaries for this row
+            let j_min = i.saturating_sub(band_width);
+            let j_max = (i + band_width).min(n);
+            
+            // Initialize edge of band
+            curr_row[0] = if j_min == 0 { i as u32 } else { u32::MAX };
+            
+            for j in j_min.max(1)..=j_max {
+                let k = j - j_min;  // Index into band
+                let cost = if s1[i-1] == s2[j-1] { 0u32 } else { 1u32 };
+                
+                // Standard DL recurrence
+                let mut min_cost = u32::MAX;
+                
+                // Deletion
+                if k > 0 {
+                    min_cost = min_cost.min(prev_row[k-1].saturating_add(1));
+                }
+                // Insertion
+                min_cost = min_cost.min(curr_row[k].saturating_add(1));
+                // Substitution
+                if k > 0 {
+                    min_cost = min_cost.min(prev_row[k].saturating_add(cost));
+                }
+                
+                // Transposition (the DL-specific operation)
+                if i > 1 && j > 1 && s1[i-1] == s2[j-2] && s1[i-2] == s2[j-1] {
+                    // Need to access prev_prev_row[j-2] which is k-1 in band coords
+                    if k >= 2 {
+                        min_cost = min_cost.min(prev_prev_row[k-2].saturating_add(1));
+                    }
+                }
+                
+                curr_row[k+1] = min_cost;
+            }
+            
+            // Rotate rows
+            std::mem::swap(&mut prev_prev_row, &mut prev_row);
+            std::mem::swap(&mut prev_row, &mut curr_row);
+        }
+        
+        let result = prev_row[n - m.saturating_sub(band_width) + 1];
+        if result <= max_distance as u32 {
+            Some(result as usize)
+        } else {
+            None
+        }
+    }
+    ```
+  - Integrate with existing SIMD infrastructure for band computation
+- **Subtasks:**
+  - Subtask 130.1: Implement core `damerau_levenshtein_distance_banded()` function
+  - Subtask 130.2: Handle transposition across band boundaries
+  - Subtask 130.3: Add adaptive band width estimation from length difference
+  - Subtask 130.4: Add SIMD min operations within band (reuse from Levenshtein)
+  - Subtask 130.5: Integrate into main dispatch for strings >64 chars
+  - Subtask 130.6: Benchmark banded vs full matrix on 50-500 char strings
+- **Test Strategy:** Verify correctness against full matrix, benchmark speedup
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+**Task 131: Transposition-Aware SIMD for Damerau-Levenshtein (HIGH PRIORITY)**
+
+- **Priority:** High
+- **Dependencies:** Task 130 (builds on banded algorithm)
+- **Description:** Optimize the transposition check to work efficiently with SIMD by pre-computing transposition positions
+- **Expected Impact:** Additional 30-50% speedup on top of diagonal band
+- **Root Cause:** Current transposition check breaks SIMD parallelism due to data dependency
+- **Implementation:**
+  - Pre-compute positions where transposition is possible:
+    ```rust
+    fn precompute_transposition_positions(s1: &[u8], s2: &[u8]) -> Vec<(usize, usize)> {
+        // Find all (i, j) where s1[i] == s2[j-1] AND s1[i-1] == s2[j]
+        let mut positions = Vec::new();
+        for i in 1..s1.len() {
+            for j in 1..s2.len() {
+                if s1[i] == s2[j-1] && s1[i-1] == s2[j] {
+                    positions.push((i, j));
+                }
+            }
+        }
+        positions
+    }
+    ```
+  - Use bitmap to mark transposition-eligible cells:
+    ```rust
+    // For cells in same SIMD lane, process normally
+    // For transposition positions, do scalar update after SIMD pass
+    fn damerau_levenshtein_simd_with_transpositions(
+        s1: &[u8], s2: &[u8], 
+        trans_positions: &[(usize, usize)]
+    ) -> usize {
+        // Phase 1: Standard Levenshtein SIMD (without transpositions)
+        // Phase 2: Apply transposition corrections at marked positions
+    }
+    ```
+  - Alternative: Two-pass algorithm:
+    1. First pass: Compute standard Levenshtein with SIMD
+    2. Second pass: Check and apply transposition improvements
+- **Subtasks:**
+  - Subtask 131.1: Implement `precompute_transposition_positions()` function
+  - Subtask 131.2: Create two-pass SIMD algorithm (Levenshtein + transposition fix)
+  - Subtask 131.3: Optimize transposition position lookup with spatial indexing
+  - Subtask 131.4: Benchmark two-pass vs single-pass with dependency
+  - Subtask 131.5: Profile to verify SIMD utilization improvement
+- **Test Strategy:** Verify correctness, profile SIMD lane utilization
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+### Critical Jaro-Winkler Optimizations
+
+**Task 132: Fully Vectorized Match-Finding Loop for Jaro-Winkler (CRITICAL PRIORITY)**
+
+- **Priority:** Critical
+- **Dependencies:** None
+- **Description:** Replace the scalar inner loop in Jaro match-finding with fully vectorized SIMD implementation
+- **Expected Impact:** 2-4x speedup for strings >64 chars (where RapidFuzz beats us)
+- **Root Cause:** Current code uses SIMD for auxiliary operations but core match-finding is scalar
+- **Current Problem Code:**
+  ```rust
+  // ❌ Current: Scalar inner loop (THIS IS WHY WE'RE SLOW!)
+  for j in start..=end {
+      if !s2_matched[j] && s1[i] == s2[j] {
+          s1_matched[i] = true;
+          s2_matched[j] = true;
+          matches += 1;
+          break;
+      }
+  }
+  ```
+- **Implementation:**
+  - Vectorize the entire match-finding loop:
+    ```rust
+    fn jaro_find_matches_simd(
+        s1: &[u8], 
+        s2: &[u8], 
+        match_distance: usize
+    ) -> (u32, Vec<u8>, Vec<u8>) {
+        const W: usize = 32;
+        type SimdU8 = Simd<u8, W>;
+        
+        let mut matches = 0u32;
+        let mut s1_matched = vec![0u8; s1.len()];
+        let mut s2_matched = vec![0u8; s2.len()];
+        
+        for i in 0..s1.len() {
+            let needle = s1[i];
+            let needle_vec = SimdU8::splat(needle);
+            
+            let start = i.saturating_sub(match_distance);
+            let end = (i + match_distance + 1).min(s2.len());
+            
+            // SIMD search within match window
+            let mut found = false;
+            let mut j = start;
+            
+            while j + W <= end && !found {
+                // Load 32 characters from s2
+                let haystack = SimdU8::from_slice(&s2[j..j + W]);
+                
+                // Load 32 match flags
+                let matched_flags = SimdU8::from_slice(&s2_matched[j..j + W]);
+                
+                // Find positions where: s2[j] == needle AND s2_matched[j] == 0
+                let char_eq = haystack.simd_eq(needle_vec);
+                let not_matched = matched_flags.simd_eq(SimdU8::splat(0));
+                let valid = char_eq & not_matched;
+                
+                let mask = valid.to_bitmask();
+                if mask != 0 {
+                    // Found a match! Get first position
+                    let offset = mask.trailing_zeros() as usize;
+                    let match_pos = j + offset;
+                    
+                    s1_matched[i] = 1;
+                    s2_matched[match_pos] = 1;
+                    matches += 1;
+                    found = true;
+                }
+                
+                j += W;
+            }
+            
+            // Scalar fallback for remainder
+            if !found {
+                for jj in j..end {
+                    if s2_matched[jj] == 0 && s2[jj] == needle {
+                        s1_matched[i] = 1;
+                        s2_matched[jj] = 1;
+                        matches += 1;
+                        break;
+                    }
+                }
+            }
+        }
+        
+        (matches, s1_matched, s2_matched)
+    }
+    ```
+  - Key insight: Load both characters AND match flags in SIMD, combine with AND
+  - Process 32 characters per iteration instead of 1
+- **Subtasks:**
+  - Subtask 132.1: Implement `jaro_find_matches_simd()` with full vectorization
+  - Subtask 132.2: Handle match window boundaries correctly
+  - Subtask 132.3: Optimize match flag storage (consider u64 bitmask for ≤64 chars)
+  - Subtask 132.4: Add ARM NEON version using `uint8x16_t`
+  - Subtask 132.5: Integrate with existing `jaro_similarity_bytes_simd_large()`
+  - Subtask 132.6: Benchmark vectorized vs scalar match-finding on 100-500 char strings
+- **Test Strategy:** Verify correctness, benchmark on long strings
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+**Task 133: Block-Based Jaro for Very Long Strings (HIGH PRIORITY)**
+
+- **Priority:** High
+- **Dependencies:** Task 132
+- **Description:** Implement block-based processing for very long strings (>256 chars) to improve cache efficiency
+- **Expected Impact:** 30-50% speedup for very long strings
+- **Root Cause:** For very long strings, match window can span 100+ chars, causing cache thrashing
+- **Implementation:**
+  - Process strings in cache-friendly blocks:
+    ```rust
+    fn jaro_similarity_blocked(s1: &[u8], s2: &[u8]) -> f32 {
+        const BLOCK_SIZE: usize = 64;  // Fits in L1 cache
+        
+        let match_distance = (s1.len().max(s2.len()) / 2).saturating_sub(1);
+        
+        // If match distance is small, use direct SIMD
+        if match_distance <= BLOCK_SIZE {
+            return jaro_similarity_simd_direct(s1, s2);
+        }
+        
+        // Block-based processing for large match distances
+        let mut total_matches = 0u32;
+        let mut s1_matched = vec![false; s1.len()];
+        let mut s2_matched = vec![false; s2.len()];
+        
+        // Process s1 in blocks
+        for block_start in (0..s1.len()).step_by(BLOCK_SIZE) {
+            let block_end = (block_start + BLOCK_SIZE).min(s1.len());
+            
+            // Match window for this block
+            let window_start = block_start.saturating_sub(match_distance);
+            let window_end = (block_end + match_distance).min(s2.len());
+            
+            // Process matches for this block
+            // Only need to load window_start..window_end from s2
+            let matches = find_matches_in_block(
+                &s1[block_start..block_end],
+                &s2[window_start..window_end],
+                &mut s1_matched[block_start..block_end],
+                &mut s2_matched[window_start..window_end],
+            );
+            
+            total_matches += matches;
+        }
+        
+        // Count transpositions and compute Jaro score
+        let transpositions = count_transpositions(&s1_matched, &s2_matched, s1, s2);
+        compute_jaro_score(total_matches, transpositions, s1.len(), s2.len())
+    }
+    ```
+  - Benefits:
+    - Better cache locality (block + window fit in L1)
+    - Reduced memory bandwidth
+    - Can parallelize blocks with Rayon
+- **Subtasks:**
+  - Subtask 133.1: Implement `jaro_similarity_blocked()` function
+  - Subtask 133.2: Implement `find_matches_in_block()` with SIMD
+  - Subtask 133.3: Handle block boundary edge cases
+  - Subtask 133.4: Add parallel block processing with Rayon
+  - Subtask 133.5: Tune block size for optimal cache utilization
+  - Subtask 133.6: Benchmark blocked vs non-blocked on 500-2000 char strings
+- **Test Strategy:** Verify correctness, profile cache misses
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+**Task 134: Hybrid Algorithm Selection for Jaro-Winkler (MEDIUM PRIORITY)**
+
+- **Priority:** Medium
+- **Dependencies:** Tasks 132, 133
+- **Description:** Implement intelligent algorithm selection based on string characteristics to always use optimal path
+- **Expected Impact:** 10-20% overall improvement by always choosing best algorithm
+- **Implementation:**
+  - Create unified dispatch that selects optimal algorithm:
+    ```rust
+    fn jaro_similarity_optimal(s1: &[u8], s2: &[u8]) -> f32 {
+        let len1 = s1.len();
+        let len2 = s2.len();
+        let max_len = len1.max(len2);
+        
+        // Select optimal algorithm based on string characteristics
+        match max_len {
+            // Very short: Direct comparison (no SIMD overhead)
+            0..=8 => jaro_similarity_tiny(s1, s2),
+            
+            // Short: Bit-parallel with u64 bitmasks
+            9..=64 => jaro_similarity_bitparallel_optimized(s1, s2),
+            
+            // Medium: Fully vectorized SIMD
+            65..=256 => jaro_similarity_simd_vectorized(s1, s2),
+            
+            // Long: Block-based with SIMD
+            257..=1024 => jaro_similarity_blocked(s1, s2),
+            
+            // Very long: Parallel block-based
+            _ => jaro_similarity_parallel_blocked(s1, s2),
+        }
+    }
+    ```
+  - Add character diversity analysis for hash-based path:
+    ```rust
+    fn should_use_hash_based(s1: &[u8], s2: &[u8]) -> bool {
+        // Hash-based is better when character diversity is high
+        // (many unique characters = less benefit from SIMD char search)
+        let unique_s1 = count_unique_chars(s1);
+        let unique_s2 = count_unique_chars(s2);
+        
+        // If >50% unique characters, hash-based may be faster
+        unique_s1 > s1.len() / 2 || unique_s2 > s2.len() / 2
+    }
+    ```
+- **Subtasks:**
+  - Subtask 134.1: Implement `jaro_similarity_optimal()` dispatch function
+  - Subtask 134.2: Add `jaro_similarity_tiny()` for very short strings
+  - Subtask 134.3: Implement character diversity analysis
+  - Subtask 134.4: Add benchmarks for each algorithm on each length range
+  - Subtask 134.5: Tune length thresholds based on benchmarks
+- **Test Strategy:** Benchmark on representative string length distribution
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+### Phase 16 Success Criteria
+- Myers' bit-parallel for DL provides 2-3x speedup for strings ≤64 chars
+- Diagonal band for DL provides 5-10x speedup for medium-long strings
+- **Damerau-Levenshtein should be 1.2-1.5x FASTER than RapidFuzz after all optimizations**
+- Fully vectorized Jaro match-finding provides 2-4x speedup for long strings
+- Block-based Jaro provides 30-50% additional speedup for very long strings
+- **Jaro-Winkler should be 1.5-2x FASTER than RapidFuzz at all scales**
+- All optimizations maintain correctness (all tests pass)
+- Benchmark results documented and verified against RapidFuzz
+
+### Phase 16 Dependencies
+- Phase 16 (Tasks 129-134) can proceed after Phase 15
+- Task 129 (Myers DL) is independent
+- Task 130 (Banded DL) is independent
+- Task 131 (Transposition SIMD) depends on Task 130
+- Task 132 (Vectorized Jaro) is independent
+- Task 133 (Blocked Jaro) depends on Task 132
+- Task 134 (Hybrid Selection) depends on Tasks 132, 133
+
+---
+
+## Phase 17: RapidFuzz Parity Optimizations (Critical Performance Gap Closers)
+
+### Overview
+Based on deep analysis of RapidFuzz's C++ implementation (https://github.com/rapidfuzz/rapidfuzz-cpp), this phase implements the key algorithmic optimizations that give RapidFuzz its performance edge. These are not SIMD optimizations but fundamental algorithm improvements that reduce computational complexity.
+
+### Phase 17 Goals
+- Close the remaining performance gap with RapidFuzz for Jaro-Winkler
+- Achieve 2-3x additional speedup for Levenshtein on high-similarity strings
+- Enable competitive performance for fuzzy join batch operations
+- Match RapidFuzz's algorithmic sophistication while maintaining Polars code style
+
+### Phase 17 Tasks (135-140)
+
+**Task 135: Common Prefix/Suffix Removal (HIGH PRIORITY - QUICK WIN)**
+
+- **Priority:** Critical
+- **Dependencies:** None
+- **Description:** Before running any edit distance algorithm, remove common prefixes and suffixes from both strings. This is the #1 missing optimization - RapidFuzz does this for ALL algorithms (Levenshtein, Damerau-Levenshtein, Jaro).
+- **Expected Impact:** 10-50% speedup for similar strings (the common case in fuzzy matching!)
+- **Rationale:** When comparing "hello world" to "hello universe", we currently process all characters. RapidFuzz first removes "hello " (prefix) leaving us with "world" vs "universe" - a much smaller problem.
+- **Implementation:**
+  ```rust
+  /// Remove common prefix and suffix from two byte slices.
+  /// Returns (s1_trimmed, s2_trimmed, prefix_len, suffix_len)
+  #[inline(always)]
+  fn remove_common_affix<'a>(s1: &'a [u8], s2: &'a [u8]) -> (&'a [u8], &'a [u8], usize, usize) {
+      // Find common prefix using SIMD comparison where possible
+      let prefix_len = s1.iter()
+          .zip(s2.iter())
+          .take_while(|(a, b)| a == b)
+          .count();
+      
+      let s1_after_prefix = &s1[prefix_len..];
+      let s2_after_prefix = &s2[prefix_len..];
+      
+      // Find common suffix (excluding already-matched prefix)
+      let suffix_len = s1_after_prefix.iter().rev()
+          .zip(s2_after_prefix.iter().rev())
+          .take_while(|(a, b)| a == b)
+          .count();
+      
+      let s1_trimmed = &s1_after_prefix[..s1_after_prefix.len() - suffix_len];
+      let s2_trimmed = &s2_after_prefix[..s2_after_prefix.len() - suffix_len];
+      
+      (s1_trimmed, s2_trimmed, prefix_len, suffix_len)
+  }
+  
+  /// SIMD-accelerated prefix finding for long strings
+  #[cfg(feature = "simd")]
+  #[inline(always)]
+  fn find_common_prefix_simd(s1: &[u8], s2: &[u8]) -> usize {
+      const SIMD_WIDTH: usize = 32;
+      type SimdU8 = Simd<u8, SIMD_WIDTH>;
+      
+      let len = s1.len().min(s2.len());
+      let chunks = len / SIMD_WIDTH;
+      
+      for i in 0..chunks {
+          let offset = i * SIMD_WIDTH;
+          let v1 = SimdU8::from_slice(&s1[offset..]);
+          let v2 = SimdU8::from_slice(&s2[offset..]);
+          let mask = v1.simd_ne(v2);
+          if mask.any() {
+              // Find first mismatch within chunk
+              let mask_bits = mask.to_bitmask();
+              return offset + mask_bits.trailing_zeros() as usize;
+          }
+      }
+      
+      // Scalar fallback for remainder
+      let remainder_start = chunks * SIMD_WIDTH;
+      for i in remainder_start..len {
+          if s1[i] != s2[i] {
+              return i;
+          }
+      }
+      len
+  }
+  ```
+- **Integration Points:**
+  - `levenshtein_distance_*()` - Call at function entry before any algorithm
+  - `damerau_levenshtein_*()` - Call at function entry
+  - `jaro_similarity_*()` - For Jaro, prefix removal is already used for Winkler bonus, but suffix removal is new
+- **Subtasks:**
+  - Subtask 135.1: Implement `remove_common_affix()` function
+  - Subtask 135.2: Implement SIMD-accelerated `find_common_prefix_simd()` for strings > 64 bytes
+  - Subtask 135.3: Implement SIMD-accelerated `find_common_suffix_simd()` for strings > 64 bytes
+  - Subtask 135.4: Integrate into `levenshtein_distance_adaptive_band()` and all Levenshtein variants
+  - Subtask 135.5: Integrate into `damerau_levenshtein_distance_banded()` and all DL variants
+  - Subtask 135.6: Integrate into `jaro_similarity()` (for suffix removal)
+  - Subtask 135.7: Add unit tests for edge cases (all-same, no-common, unicode boundaries)
+  - Subtask 135.8: Benchmark on high-similarity strings (>80% similar)
+- **Test Strategy:** Verify correctness with edge cases, benchmark against RapidFuzz on similar strings
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+**Task 136: mbleven2018 Algorithm for Tiny Edit Distances (HIGH PRIORITY)**
+
+- **Priority:** High
+- **Dependencies:** Task 135 (common affix removal should run first)
+- **Description:** Implement the mbleven2018 algorithm for computing Levenshtein distance when max edit distance ≤ 3. This uses a precomputed lookup table of all possible edit sequences and is faster than Myers' bit-parallel for very small distances.
+- **Expected Impact:** 2-5x speedup for high-similarity string pairs (the common case in fuzzy matching)
+- **Rationale:** In fuzzy matching, most comparisons are between similar strings (threshold > 0.7 means edit distance often ≤ 3). Myers' algorithm has setup overhead (pattern match vector) that dominates for tiny distances.
+- **Implementation:**
+  ```rust
+  /// Precomputed lookup table for mbleven2018 algorithm.
+  /// Each u8 encodes an edit sequence: 01=DELETE, 10=INSERT, 11=SUBSTITUTE
+  /// Rows are indexed by: (max_dist + max_dist*max_dist) / 2 + len_diff - 1
+  const MBLEVEN2018_MATRIX: [[u8; 7]; 9] = [
+      // max edit distance 1
+      [0x03, 0, 0, 0, 0, 0, 0],         // len_diff 0: substitute
+      [0x01, 0, 0, 0, 0, 0, 0],         // len_diff 1: delete
+      // max edit distance 2
+      [0x0F, 0x09, 0x06, 0, 0, 0, 0],   // len_diff 0
+      [0x0D, 0x07, 0, 0, 0, 0, 0],      // len_diff 1
+      [0x05, 0, 0, 0, 0, 0, 0],         // len_diff 2
+      // max edit distance 3
+      [0x3F, 0x27, 0x2D, 0x39, 0x36, 0x1E, 0x1B], // len_diff 0
+      [0x3D, 0x37, 0x1F, 0x25, 0x19, 0x16, 0],    // len_diff 1
+      [0x35, 0x1D, 0x17, 0, 0, 0, 0],             // len_diff 2
+      [0x15, 0, 0, 0, 0, 0, 0],                   // len_diff 3
+  ];
+  
+  /// Compute Levenshtein distance using mbleven2018 for max_dist ≤ 3.
+  /// Returns Some(distance) if distance <= max_dist, None otherwise.
+  #[inline(always)]
+  fn levenshtein_mbleven2018(s1: &[u8], s2: &[u8], max_dist: usize) -> Option<usize> {
+      debug_assert!(max_dist <= 3);
+      debug_assert!(!s1.is_empty() && !s2.is_empty());
+      debug_assert!(s1[0] != s2[0]); // Common prefix already removed
+      debug_assert!(s1[s1.len()-1] != s2[s2.len()-1]); // Common suffix already removed
+      
+      // Ensure s1 is longer
+      let (s1, s2) = if s1.len() < s2.len() { (s2, s1) } else { (s1, s2) };
+      let len_diff = s1.len() - s2.len();
+      
+      if len_diff > max_dist {
+          return None;
+      }
+      
+      // Special case: max_dist == 1
+      if max_dist == 1 {
+          return if len_diff == 1 || s1.len() == 1 {
+              Some(max_dist + 1)
+          } else {
+              None
+          };
+      }
+      
+      // Look up possible edit sequences
+      let ops_index = (max_dist + max_dist * max_dist) / 2 + len_diff - 1;
+      let possible_ops = &MBLEVEN2018_MATRIX[ops_index];
+      
+      let mut best_dist = max_dist + 1;
+      
+      for &ops in possible_ops.iter() {
+          if ops == 0 { break; }
+          
+          let mut iter_s1 = 0;
+          let mut iter_s2 = 0;
+          let mut cur_dist = 0;
+          let mut ops = ops;
+          
+          while iter_s1 < s1.len() && iter_s2 < s2.len() {
+              if s1[iter_s1] != s2[iter_s2] {
+                  cur_dist += 1;
+                  if ops == 0 { break; }
+                  if ops & 1 != 0 { iter_s1 += 1; } // DELETE
+                  if ops & 2 != 0 { iter_s2 += 1; } // INSERT
+                  ops >>= 2;
+              } else {
+                  iter_s1 += 1;
+                  iter_s2 += 1;
+              }
+          }
+          
+          cur_dist += (s1.len() - iter_s1) + (s2.len() - iter_s2);
+          best_dist = best_dist.min(cur_dist);
+      }
+      
+      if best_dist <= max_dist { Some(best_dist) } else { None }
+  }
+  ```
+- **Subtasks:**
+  - Subtask 136.1: Implement `MBLEVEN2018_MATRIX` constant lookup table
+  - Subtask 136.2: Implement `levenshtein_mbleven2018()` function
+  - Subtask 136.3: Integrate into `levenshtein_distance()` dispatcher (call when max_dist ≤ 3 and strings are short)
+  - Subtask 136.4: Add comprehensive unit tests including edge cases
+  - Subtask 136.5: Benchmark against Myers' bit-parallel for edit distances 1, 2, 3
+  - Subtask 136.6: Tune threshold for when to use mbleven vs Myers
+- **Test Strategy:** Exhaustive testing for small strings, benchmark against RapidFuzz
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+**Task 137: Score Hint Doubling (Iterative Band Widening) (HIGH PRIORITY)**
+
+- **Priority:** High
+- **Dependencies:** Task 135
+- **Description:** Instead of always using the maximum possible band width, start with a small "score hint" and double it until the actual distance is found. This dramatically reduces work for strings with moderate similarity.
+- **Expected Impact:** 2-10x speedup for moderate-distance strings (the algorithm often terminates early)
+- **Rationale:** Most fuzzy match operations have a threshold (e.g., > 0.7 similarity). A score_hint of 31 captures most matches, and doubling a few times handles the rest - much cheaper than always computing with max band.
+- **Implementation:**
+  ```rust
+  /// Compute Levenshtein distance with iterative band widening.
+  /// Starts with score_hint and doubles until actual distance is found.
+  #[inline]
+  fn levenshtein_distance_adaptive(s1: &[u8], s2: &[u8], score_cutoff: usize) -> usize {
+      // Start with a reasonable initial hint
+      let mut score_hint = 31.min(score_cutoff);
+      
+      loop {
+          // Try computing with current hint as max distance
+          let result = levenshtein_distance_banded_with_max(s1, s2, score_hint);
+          
+          // If result is within hint, we found the actual distance
+          if result <= score_hint {
+              return result;
+          }
+          
+          // If hint >= cutoff, we're done (distance exceeds threshold)
+          if score_hint >= score_cutoff {
+              return score_cutoff + 1;
+          }
+          
+          // Double the hint and retry
+          score_hint = (score_hint * 2).min(score_cutoff);
+      }
+  }
+  
+  /// Banded computation that returns early if distance exceeds max.
+  #[inline]
+  fn levenshtein_distance_banded_with_max(s1: &[u8], s2: &[u8], max: usize) -> usize {
+      // Use appropriate algorithm based on string length and band width
+      let full_band = s1.len().min(2 * max + 1);
+      
+      if s1.len() <= 64 {
+          // Short strings: use Myers' single-word
+          myers_bit_parallel_distance_bounded(s1, s2, max).unwrap_or(max + 1)
+      } else if full_band <= 64 {
+          // Band fits in single word: use diagonal-shifting
+          levenshtein_small_band_diagonal(s1, s2, max)
+      } else {
+          // Large band: use block-based algorithm
+          levenshtein_distance_banded(s1, s2, max)
+      }
+  }
+  ```
+- **Subtasks:**
+  - Subtask 137.1: Implement `levenshtein_distance_adaptive()` with score hint doubling
+  - Subtask 137.2: Implement `levenshtein_distance_banded_with_max()` dispatcher
+  - Subtask 137.3: Update all Levenshtein similarity entry points to use adaptive version
+  - Subtask 137.4: Implement `damerau_levenshtein_distance_adaptive()` with same pattern
+  - Subtask 137.5: Add benchmarks comparing fixed-band vs adaptive approach
+  - Subtask 137.6: Tune initial score_hint value (31 vs 63 vs 15)
+- **Test Strategy:** Verify correctness, benchmark on various similarity distributions
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+**Task 138: Small Band Diagonal Shifting Algorithm (MEDIUM PRIORITY)**
+
+- **Priority:** Medium
+- **Dependencies:** Task 137
+- **Description:** When the band width fits in a single 64-bit word, use a clever diagonal-shifting technique that avoids multi-word BlockPatternMatchVector operations. RapidFuzz's `levenshtein_hyrroe2003_small_band` shifts the band RIGHT instead of left.
+- **Expected Impact:** 2-3x speedup for banded computation when band ≤ 64
+- **Rationale:** The standard Myers algorithm shifts VP left and tracks the bottom row. The diagonal-shifting variant shifts VP right and tracks the diagonal, which is more efficient for banded computation.
+- **Implementation:**
+  ```rust
+  /// Levenshtein distance using diagonal-shifting for small bands.
+  /// Band must fit in 64 bits (i.e., max_distance <= 31 for practical use).
+  #[inline(always)]
+  fn levenshtein_small_band_diagonal(s1: &[u8], s2: &[u8], max: usize) -> usize {
+      debug_assert!(max <= 31); // Band = 2*max+1 must fit in 64 bits
+      
+      // Initialize VP with high bits set (diagonal starts at top-left)
+      let mut vp: u64 = !0u64 << (64 - max - 1);
+      let mut vn: u64 = 0;
+      
+      let mut curr_dist = max;
+      let diagonal_mask = 1u64 << 63;
+      let mut horizontal_mask = 1u64 << 62;
+      
+      // Break score: distance can decrease along horizontal but not diagonal
+      let break_score = 2 * max + s2.len() - s1.len();
+      
+      // Build pattern match vector for s1
+      let pm = build_pattern_match_vector(s1);
+      let mut start_pos: isize = (max + 1) as isize - 64;
+      
+      // Process each character in s2
+      for (j, &ch) in s2.iter().enumerate() {
+          // Get PM_j with appropriate shifting based on diagonal position
+          let pm_j = if start_pos < 0 {
+              pm.get(ch) << (-start_pos) as u32
+          } else {
+              let word = start_pos as usize / 64;
+              let word_pos = start_pos as usize % 64;
+              let mut val = pm.get_word(word, ch) >> word_pos;
+              if word_pos != 0 && word + 1 < pm.num_words() {
+                  val |= pm.get_word(word + 1, ch) << (64 - word_pos);
+              }
+              val
+          };
+          
+          // Compute D0, HP, HN (same as standard Myers)
+          let x = pm_j;
+          let d0 = (((x & vp).wrapping_add(vp)) ^ vp) | x | vn;
+          let hp = vn | !(d0 | vp);
+          let hn = d0 & vp;
+          
+          // Update distance based on diagonal (not bottom row!)
+          if j < s1.len() - max {
+              // Phase 1: diagonal stays fixed, band slides
+              curr_dist += (!d0 & diagonal_mask != 0) as usize;
+          } else {
+              // Phase 2: horizontal tracking
+              curr_dist += (hp & horizontal_mask != 0) as usize;
+              curr_dist -= (hn & horizontal_mask != 0) as usize;
+              horizontal_mask >>= 1;
+          }
+          
+          if curr_dist > break_score {
+              return max + 1;
+          }
+          
+          // KEY DIFFERENCE: Shift RIGHT instead of left
+          vp = hn | !((d0 >> 1) | hp);
+          vn = (d0 >> 1) & hp;
+          
+          start_pos += 1;
+      }
+      
+      if curr_dist <= max { curr_dist } else { max + 1 }
+  }
+  ```
+- **Subtasks:**
+  - Subtask 138.1: Implement `levenshtein_small_band_diagonal()` with right-shifting
+  - Subtask 138.2: Handle phase transition (diagonal tracking → horizontal tracking)
+  - Subtask 138.3: Implement break score early termination
+  - Subtask 138.4: Integrate into `levenshtein_distance_banded_with_max()` dispatcher
+  - Subtask 138.5: Add unit tests for edge cases (band at boundaries)
+  - Subtask 138.6: Benchmark against current banded implementation
+- **Test Strategy:** Verify correctness against standard algorithm, benchmark
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+**Task 139: Ukkonen Dynamic Band Adjustment (MEDIUM PRIORITY)**
+
+- **Priority:** Medium
+- **Dependencies:** Task 138
+- **Description:** Implement dynamic adjustment of first_block and last_block during banded Levenshtein computation. This narrows the band when possible and expands it when necessary, following Ukkonen's algorithm.
+- **Expected Impact:** 10-30% speedup by avoiding computation in cells that can't affect the result
+- **Rationale:** RapidFuzz tracks block scores and adjusts which blocks to process each row. Blocks that can't contribute to a better result are skipped.
+- **Implementation:**
+  ```rust
+  /// Banded Levenshtein with Ukkonen-style dynamic band adjustment.
+  fn levenshtein_distance_ukkonen_band(
+      s1: &[u8], 
+      s2: &[u8], 
+      max: usize
+  ) -> usize {
+      let word_size = 64;
+      let words = (s1.len() + word_size - 1) / word_size;
+      
+      // Track VP, VN, and score for each word
+      let mut vecs: Vec<(u64, u64)> = vec![(u64::MAX, 0); words]; // (VP, VN)
+      let mut scores: Vec<usize> = (1..=words).map(|i| i.min(words) * word_size).collect();
+      scores[words - 1] = s1.len();
+      
+      let pm = BlockPatternMatchVector::new(s1);
+      let last_bit = 1u64 << ((s1.len() - 1) % word_size);
+      
+      // Initial band bounds
+      let mut first_block = 0;
+      let mut last_block = ((max + s1.len() - s2.len()) / 2 + 1).min(words) / word_size;
+      
+      let mut current_max = max;
+      
+      for (row, &ch) in s2.iter().enumerate() {
+          let mut hp_carry = 1u64;
+          let mut hn_carry = 0u64;
+          
+          // Process blocks in current band
+          for word in first_block..=last_block {
+              let pm_j = pm.get(word, ch);
+              let (vp, vn) = vecs[word];
+              
+              let x = pm_j | hn_carry;
+              let d0 = (((x & vp).wrapping_add(vp)) ^ vp) | x | vn;
+              let hp = vn | !(d0 | vp);
+              let hn = d0 & vp;
+              
+              let hp_carry_temp = hp_carry;
+              let hn_carry_temp = hn_carry;
+              
+              if word < words - 1 {
+                  hp_carry = hp >> 63;
+                  hn_carry = hn >> 63;
+              } else {
+                  hp_carry = (hp & last_bit != 0) as u64;
+                  hn_carry = (hn & last_bit != 0) as u64;
+              }
+              
+              let new_vp = (hn << 1 | hn_carry_temp) | !((d0 | (hp << 1 | hp_carry_temp)));
+              let new_vn = (hp << 1 | hp_carry_temp) & d0;
+              vecs[word] = (new_vp, new_vn);
+              
+              scores[word] = (scores[word] as isize + hp_carry as isize - hn_carry as isize) as usize;
+          }
+          
+          // Update max based on current scores
+          current_max = current_max.min(
+              scores[last_block] + (s2.len() - row - 1).max(s1.len().saturating_sub((last_block + 1) * word_size))
+          );
+          
+          // Adjust last_block (expand if needed)
+          if last_block + 1 < words {
+              let get_row_num = |w| if w + 1 == words { s1.len() - 1 } else { (w + 1) * word_size - 1 };
+              let cond = (current_max + 2 * word_size + row + s1.len()) as isize 
+                       - (scores[last_block] + 2 + s2.len()) as isize;
+              if get_row_num(last_block) < cond as usize {
+                  last_block += 1;
+                  vecs[last_block] = (u64::MAX, 0);
+                  // Process new block...
+              }
+          }
+          
+          // Shrink band from end
+          while last_block >= first_block {
+              let in_band_cond1 = scores[last_block] < current_max + word_size;
+              if in_band_cond1 { break; }
+              last_block -= 1;
+          }
+          
+          // Shrink band from start
+          while first_block <= last_block {
+              let in_band_cond1 = scores[first_block] < current_max + word_size;
+              if in_band_cond1 { break; }
+              first_block += 1;
+          }
+          
+          // Band collapsed - distance exceeds max
+          if last_block < first_block {
+              return max + 1;
+          }
+      }
+      
+      scores[words - 1]
+  }
+  ```
+- **Subtasks:**
+  - Subtask 139.1: Implement block-wise score tracking
+  - Subtask 139.2: Implement `last_block` expansion logic
+  - Subtask 139.3: Implement band shrinking from both ends
+  - Subtask 139.4: Handle band collapse (distance exceeds max)
+  - Subtask 139.5: Integrate with existing BlockPatternMatchVector
+  - Subtask 139.6: Benchmark against static band implementation
+- **Test Strategy:** Verify correctness, compare band widths during execution
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+**Task 140: SIMD Batch Processing for Fuzzy Joins (LOWER PRIORITY)**
+
+- **Priority:** Lower (complex, defer if time-constrained)
+- **Dependencies:** Tasks 135-139
+- **Description:** Implement batch comparison of multiple s1 strings against one s2 using SIMD parallelism. This is the "cdist" pattern from RapidFuzz that enables massive speedup for fuzzy joins.
+- **Expected Impact:** 4-8x speedup for fuzzy join operations
+- **Rationale:** In fuzzy joins, we compare one string against many candidates. Instead of processing one pair at a time, we can process 4 (AVX2) or 8 (AVX-512) pairs simultaneously.
+- **Implementation:**
+  ```rust
+  /// Batch compute Levenshtein similarity for multiple s1 against single s2.
+  /// Uses SIMD to process multiple comparisons in parallel.
+  #[cfg(feature = "simd")]
+  pub fn levenshtein_similarity_batch_simd(
+      s1_strings: &[&str],
+      s2: &str,
+      scores: &mut [f32],
+      score_cutoff: f32,
+  ) {
+      // Determine optimal vector width based on string lengths
+      let max_s1_len = s1_strings.iter().map(|s| s.len()).max().unwrap_or(0);
+      
+      if max_s1_len <= 8 {
+          // Use u8 vectors (32 strings at a time with AVX2)
+          levenshtein_batch_simd_u8(s1_strings, s2, scores, score_cutoff);
+      } else if max_s1_len <= 16 {
+          // Use u16 vectors (16 strings at a time)
+          levenshtein_batch_simd_u16(s1_strings, s2, scores, score_cutoff);
+      } else if max_s1_len <= 32 {
+          // Use u32 vectors (8 strings at a time)
+          levenshtein_batch_simd_u32(s1_strings, s2, scores, score_cutoff);
+      } else {
+          // Use u64 vectors (4 strings at a time)
+          levenshtein_batch_simd_u64(s1_strings, s2, scores, score_cutoff);
+      }
+  }
+  
+  #[cfg(feature = "simd")]
+  fn levenshtein_batch_simd_u64(
+      s1_strings: &[&str],
+      s2: &str,
+      scores: &mut [f32],
+      score_cutoff: f32,
+  ) {
+      const VEC_WIDTH: usize = 4; // AVX2: 4 x u64
+      type SimdU64 = Simd<u64, 4>;
+      
+      let s2_bytes = s2.as_bytes();
+      
+      // Process strings in batches of VEC_WIDTH
+      for (batch_idx, chunk) in s1_strings.chunks(VEC_WIDTH).enumerate() {
+          // Prepare batch: build combined pattern match vectors
+          let pm = build_batch_pattern_match_vector(chunk);
+          
+          // Initialize VP, VN, score for each string in batch
+          let mut vp = SimdU64::splat(u64::MAX);
+          let mut vn = SimdU64::splat(0);
+          let mut curr_dist = SimdU64::from_array(
+              std::array::from_fn(|i| chunk.get(i).map(|s| s.len() as u64).unwrap_or(0))
+          );
+          
+          // Process s2 character by character
+          for &ch in s2_bytes {
+              // Get PM for all strings in batch (SIMD gather)
+              let pm_j = pm.get_simd(ch);
+              
+              let x = pm_j;
+              let d0 = (((x & vp) + vp) ^ vp) | x | vn;
+              let hp = vn | !(d0 | vp);
+              let hn = d0 & vp;
+              
+              // Update scores using SIMD operations
+              // (simplified - actual implementation needs proper mask handling)
+              let one = SimdU64::splat(1);
+              let mask_last_bit = SimdU64::from_array(
+                  std::array::from_fn(|i| 1u64 << (chunk.get(i).map(|s| s.len() - 1).unwrap_or(0)))
+              );
+              
+              curr_dist += (hp & mask_last_bit).simd_ne(SimdU64::splat(0)).select(one, SimdU64::splat(0));
+              curr_dist -= (hn & mask_last_bit).simd_ne(SimdU64::splat(0)).select(one, SimdU64::splat(0));
+              
+              vp = (hn << 1) | SimdU64::splat(1);
+              vp = hn | !(d0 | vp);
+              vn = (hp << 1) & d0;
+          }
+          
+          // Extract results and convert to similarity
+          let distances = curr_dist.to_array();
+          for (i, &dist) in distances.iter().enumerate() {
+              let result_idx = batch_idx * VEC_WIDTH + i;
+              if result_idx < scores.len() {
+                  let max_len = chunk[i].len().max(s2.len()) as f32;
+                  let sim = 1.0 - (dist as f32 / max_len);
+                  scores[result_idx] = if sim >= score_cutoff { sim } else { 0.0 };
+              }
+          }
+      }
+  }
+  ```
+- **Subtasks:**
+  - Subtask 140.1: Design `BatchPatternMatchVector` that stores PM for multiple strings
+  - Subtask 140.2: Implement `levenshtein_batch_simd_u64()` for strings up to 64 chars
+  - Subtask 140.3: Implement `levenshtein_batch_simd_u32()` for strings up to 32 chars (8 parallel)
+  - Subtask 140.4: Implement `levenshtein_batch_simd_u16()` for strings up to 16 chars (16 parallel)
+  - Subtask 140.5: Integrate batch API into `fuzzy_join()` for candidate comparison
+  - Subtask 140.6: Add benchmarks comparing batch vs sequential processing
+  - Subtask 140.7: Handle length heterogeneity (strings of different lengths in batch)
+- **Test Strategy:** Verify correctness against sequential, benchmark on fuzzy join workload
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+### Phase 17 Success Criteria
+- Common affix removal provides 10-30% speedup on high-similarity strings
+- mbleven2018 provides 2-3x speedup for edit distances ≤ 3
+- Score hint doubling reduces average computation by 50% for moderate similarities
+- Small band diagonal shifting matches RapidFuzz performance for band ≤ 64
+- **Polars Levenshtein should match or exceed RapidFuzz at all scales**
+- **Polars should be within 2x of RapidFuzz for Jaro-Winkler** (remaining gap due to RapidFuzz's deeper SIMD integration)
+- All optimizations maintain correctness (all tests pass)
+
+### Phase 17 Dependencies
+- Task 135 (Common Affix) is independent - implement first
+- Task 136 (mbleven2018) depends on Task 135 (affix should be removed first)
+- Task 137 (Score Hint Doubling) depends on Task 135
+- Task 138 (Small Band Diagonal) depends on Task 137
+- Task 139 (Ukkonen Dynamic Band) depends on Task 138
+- Task 140 (SIMD Batch) depends on all above - implement last
+
+### Implementation Order Recommendation
+1. **Task 135** - Quick win, easy, high impact
+2. **Task 136** - Medium effort, targets the common case
+3. **Task 137** - Medium effort, multiplicative benefit
+4. **Task 138** - Medium effort, enables efficient small band
+5. **Task 139** - Higher effort, incremental improvement
+6. **Task 140** - High effort, defer if time-constrained
+
+---
+
+## Phase 18: Jaro-Winkler Performance Optimization
+
+### Phase 18 Objective
+Optimize Jaro-Winkler similarity to achieve **parity with or exceed RapidFuzz performance** across all dataset sizes. Current benchmarks show:
+- 1K pairs, len=10: **1.33x faster** than RapidFuzz (good)
+- 10K pairs, len=20: **0.78x** (22% slower than RapidFuzz)
+- 100K pairs, len=30: **0.37x** (2.7x slower than RapidFuzz)
+
+The performance degradation at scale indicates issues with O(n×m) match-finding complexity, cache pressure, and missing preprocessing optimizations that RapidFuzz employs.
+
+### Phase 18 Background
+
+RapidFuzz achieves superior Jaro-Winkler performance through:
+1. **Position-based character lookup**: Pre-compute character positions instead of scanning
+2. **Vectorized SIMD matching**: Process multiple characters simultaneously
+3. **Cache-optimized data structures**: Minimize memory access latency
+4. **Early exit optimizations**: Skip computation when result is below threshold
+
+### Task 141: Position-Based Character Matching (Highest Priority)
+- **Goal:** Replace O(n×m) scanning with O(1) character position lookup
+- **Priority:** HIGH
+- **Expected Speedup:** 2-3x for medium strings (20-64 chars)
+- **Description:** Instead of scanning through the match window for each character in s1, pre-build a position list mapping each character value (0-255) to its positions in the shorter string. This reduces per-character lookup from O(window_size) to O(avg_char_frequency) - typically O(1-3) for ASCII text.
+- **Algorithm:**
+  ```rust
+  /// RapidFuzz-style position list for O(1) character lookup
+  #[inline(always)]
+  fn jaro_similarity_position_based(s1: &[u8], s2: &[u8]) -> f32 {
+      let len1 = s1.len();
+      let len2 = s2.len();
+      
+      if len1 == 0 && len2 == 0 { return 1.0; }
+      if len1 == 0 || len2 == 0 { return 0.0; }
+      
+      // Always process: iterate over longer string, lookup in shorter
+      let (short, long, short_len, long_len) = if len1 <= len2 {
+          (s1, s2, len1, len2)
+      } else {
+          (s2, s1, len2, len1)
+      };
+      
+      // Build character position index for short string
+      // char_starts[c] = starting index in positions array for character c
+      // char_counts[c] = count of character c in short string
+      let mut char_starts: [u8; 256] = [0; 256];
+      let mut char_counts: [u8; 256] = [0; 256];
+      
+      // Count occurrences of each character in short string
+      for &c in short {
+          char_counts[c as usize] = char_counts[c as usize].saturating_add(1);
+      }
+      
+      // Build cumulative starts (prefix sum)
+      let mut total = 0u8;
+      for i in 0..256 {
+          char_starts[i] = total;
+          total = total.saturating_add(char_counts[i]);
+      }
+      
+      // Build position list (positions in short string for each character)
+      let mut positions: [u8; 64] = [0; 64]; // Supports strings up to 64 chars
+      let mut temp_counts: [u8; 256] = [0; 256];
+      for (pos, &c) in short.iter().enumerate() {
+          let idx = char_starts[c as usize] + temp_counts[c as usize];
+          positions[idx as usize] = pos as u8;
+          temp_counts[c as usize] += 1;
+      }
+      
+      let match_distance = (long_len / 2).saturating_sub(1);
+      let mut long_matched: u64 = 0;
+      let mut short_matched: u64 = 0;
+      let mut matches = 0u32;
+      
+      // For each position in long string, lookup matching positions in short
+      for i in 0..long_len {
+          let c = long[i];
+          let count = char_counts[c as usize];
+          if count == 0 { continue; } // Character not in short string
+          
+          let start_idx = char_starts[c as usize] as usize;
+          let end_idx = start_idx + count as usize;
+          
+          // Search window bounds
+          let win_start = i.saturating_sub(match_distance);
+          let win_end = (i + match_distance + 1).min(short_len);
+          
+          // Check each position where this character appears in short
+          for idx in start_idx..end_idx {
+              let j = positions[idx] as usize;
+              if j >= win_start && j < win_end && (short_matched & (1u64 << j)) == 0 {
+                  long_matched |= 1u64 << i;
+                  short_matched |= 1u64 << j;
+                  matches += 1;
+                  break;
+              }
+          }
+      }
+      
+      if matches == 0 { return 0.0; }
+      
+      // Count transpositions using existing fast implementation
+      let transpositions = count_transpositions_fast(long, short, long_matched, short_matched);
+      
+      let m = matches as f32;
+      let t = (transpositions / 2) as f32;
+      (m / long_len as f32 + m / short_len as f32 + (m - t) / m) / 3.0
+  }
+  ```
+- **Subtasks:**
+  - Subtask 141.1: Implement `CharacterPositionIndex` struct with `build()` and `lookup()` methods
+  - Subtask 141.2: Implement `jaro_similarity_position_based()` for strings ≤64 chars
+  - Subtask 141.3: Extend to support strings 65-128 chars using u128 bitmasks
+  - Subtask 141.4: Add early exit when no characters match in position index
+  - Subtask 141.5: Integrate into `jaro_similarity_bytes_optimized()` dispatch
+  - Subtask 141.6: Benchmark against current implementation (10K and 100K datasets)
+  - Subtask 141.7: Verify correctness with comprehensive test suite
+- **Test Strategy:** Compare outputs against current implementation, benchmark at 1K/10K/100K scales
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+### Task 142: AVX2 SIMD Parallel Match Finding
+- **Goal:** Use AVX2 intrinsics to find multiple character matches simultaneously
+- **Priority:** HIGH
+- **Expected Speedup:** 1.3-1.5x additional on top of Task 141
+- **Description:** Process match-finding using AVX2 256-bit vectors to compare 32 characters at once. This accelerates the inner loop of the Jaro algorithm significantly.
+- **Algorithm:**
+  ```rust
+  #[cfg(target_arch = "x86_64")]
+  #[target_feature(enable = "avx2")]
+  #[inline]
+  unsafe fn find_matches_avx2(
+      s1: &[u8], 
+      s2: &[u8], 
+      match_distance: usize
+  ) -> (u64, u64, u32) {
+      use std::arch::x86_64::*;
+      
+      let len1 = s1.len();
+      let len2 = s2.len();
+      
+      let mut s1_matches: u64 = 0;
+      let mut s2_matches: u64 = 0;
+      let mut match_count = 0u32;
+      
+      // Process each character in s1
+      for i in 0..len1 {
+          let needle = _mm256_set1_epi8(s1[i] as i8);
+          let start = i.saturating_sub(match_distance);
+          let end = (i + match_distance + 1).min(len2);
+          
+          // Use SIMD when search window is large enough
+          if end - start >= 32 && start + 32 <= len2 {
+              let chunk = _mm256_loadu_si256(s2[start..].as_ptr() as *const __m256i);
+              let cmp = _mm256_cmpeq_epi8(needle, chunk);
+              let mut mask = _mm256_movemask_epi8(cmp) as u32;
+              
+              // Clear already-matched positions
+              let already_matched = (s2_matches >> start) as u32;
+              mask &= !already_matched;
+              mask &= (1u32 << (end - start).min(32)) - 1;
+              
+              if mask != 0 {
+                  let j = start + mask.trailing_zeros() as usize;
+                  s1_matches |= 1u64 << i;
+                  s2_matches |= 1u64 << j;
+                  match_count += 1;
+                  continue;
+              }
+          }
+          
+          // Scalar fallback for small windows
+          for j in start..end {
+              if (s2_matches & (1u64 << j)) == 0 && s2[j] == s1[i] {
+                  s1_matches |= 1u64 << i;
+                  s2_matches |= 1u64 << j;
+                  match_count += 1;
+                  break;
+              }
+          }
+      }
+      
+      (s1_matches, s2_matches, match_count)
+  }
+  ```
+- **Subtasks:**
+  - Subtask 142.1: Implement `find_matches_avx2()` with proper safety guards
+  - Subtask 142.2: Add runtime CPU feature detection using `is_x86_feature_detected!`
+  - Subtask 142.3: Implement SSE2 fallback for older CPUs
+  - Subtask 142.4: Create `jaro_similarity_simd_avx2()` wrapper function
+  - Subtask 142.5: Integrate with existing dispatch in `jaro_similarity_bytes_optimized()`
+  - Subtask 142.6: Benchmark on AVX2-capable and non-AVX2 systems
+- **Test Strategy:** Verify identical results to scalar, benchmark SIMD vs scalar paths
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+### Task 143: Parallel Batch Processing with Rayon
+- **Goal:** Process large datasets (10K+ pairs) in parallel for 1.5-2x speedup
+- **Priority:** MEDIUM-HIGH
+- **Expected Speedup:** 1.5-2x for 100K+ pairs on multi-core systems
+- **Description:** When processing more than a threshold number of string pairs (e.g., 10K), use Rayon to parallelize across multiple CPU cores. Each thread processes a chunk of pairs independently.
+- **Algorithm:**
+  ```rust
+  /// Parallel Jaro-Winkler for large datasets
+  pub fn jaro_winkler_similarity_parallel(
+      ca: &StringChunked, 
+      other: &StringChunked
+  ) -> Float32Chunked {
+      const PARALLEL_THRESHOLD: usize = 10_000;
+      
+      let len = ca.len();
+      if len < PARALLEL_THRESHOLD {
+          return jaro_winkler_similarity(ca, other);
+      }
+      
+      // Collect string references first (avoiding repeated ChunkedArray access)
+      let pairs: Vec<_> = ca.iter().zip(other.iter()).collect();
+      
+      // Process in parallel using Rayon
+      use rayon::prelude::*;
+      
+      let results: Vec<Option<f32>> = pairs
+          .par_iter()
+          .map(|(a, b)| jaro_winkler_similarity_impl(*a, *b))
+          .collect();
+      
+      Float32Chunked::from_iter(results)
+  }
+  ```
+- **Subtasks:**
+  - Subtask 143.1: Add Rayon dependency to polars-ops Cargo.toml (if not present)
+  - Subtask 143.2: Implement `jaro_winkler_similarity_parallel()` function
+  - Subtask 143.3: Determine optimal `PARALLEL_THRESHOLD` via benchmarking
+  - Subtask 143.4: Implement chunk-based parallel processing for better cache locality
+  - Subtask 143.5: Update `jaro_winkler_similarity()` to dispatch to parallel version
+  - Subtask 143.6: Add benchmarks comparing sequential vs parallel on 10K/100K/1M pairs
+  - Subtask 143.7: Ensure thread safety of all shared data structures
+- **Test Strategy:** Verify identical results to sequential, benchmark on multi-core systems
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+### Task 144: Early Exit with Length-Based Upper Bound
+- **Goal:** Skip full computation when Jaro similarity will definitely be below threshold
+- **Priority:** MEDIUM
+- **Expected Speedup:** 10-30% for threshold-based filtering operations
+- **Description:** Before computing full Jaro similarity, check if the maximum possible similarity (based on string lengths) can meet the threshold. This optimization is especially valuable for fuzzy matching where most candidates are rejected.
+- **Algorithm:**
+  ```rust
+  /// Check if Jaro similarity can possibly meet threshold based on lengths alone
+  #[inline(always)]
+  fn jaro_max_possible(len1: usize, len2: usize) -> f32 {
+      if len1 == 0 && len2 == 0 { return 1.0; }
+      if len1 == 0 || len2 == 0 { return 0.0; }
+      
+      // Maximum Jaro occurs when:
+      // - All characters of shorter string match
+      // - No transpositions
+      // max_jaro = (shorter/longer + 1 + 1) / 3
+      let shorter = len1.min(len2) as f32;
+      let longer = len1.max(len2) as f32;
+      (shorter / longer + 2.0) / 3.0
+  }
+  
+  /// Jaro-Winkler with early exit based on threshold
+  #[inline(always)]
+  fn jaro_winkler_with_threshold(s1: &[u8], s2: &[u8], threshold: f32) -> Option<f32> {
+      let len1 = s1.len();
+      let len2 = s2.len();
+      
+      // Early exit: check if maximum possible Jaro can meet threshold
+      let max_jaro = jaro_max_possible(len1, len2);
+      
+      // Max Jaro-Winkler = max_jaro + (4 * 0.1 * (1 - max_jaro))
+      // = max_jaro + 0.4 - 0.4 * max_jaro = 0.6 * max_jaro + 0.4
+      let max_jw = 0.6 * max_jaro + 0.4;
+      
+      if max_jw < threshold {
+          return None; // Will definitely be below threshold
+      }
+      
+      // Compute actual similarity
+      let jaro = jaro_similarity_position_based(s1, s2);
+      let prefix_len = common_prefix_len(s1, s2, 4);
+      let similarity = jaro + (prefix_len as f32 * 0.1 * (1.0 - jaro));
+      
+      if similarity >= threshold {
+          Some(similarity)
+      } else {
+          None
+      }
+  }
+  ```
+- **Subtasks:**
+  - Subtask 144.1: Implement `jaro_max_possible()` upper bound function
+  - Subtask 144.2: Implement `jaro_winkler_max_possible()` including prefix bonus
+  - Subtask 144.3: Add `jaro_winkler_with_threshold()` variant
+  - Subtask 144.4: Expose threshold parameter in Python bindings
+  - Subtask 144.5: Integrate with fuzzy join operations for candidate filtering
+  - Subtask 144.6: Benchmark on typical fuzzy matching workloads (90% rejection rate)
+- **Test Strategy:** Verify threshold filtering produces correct results, benchmark rejection scenarios
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+### Task 145: Cache-Optimized Batch Processing
+- **Goal:** Process string pairs in cache-friendly batches to minimize memory latency
+- **Priority:** MEDIUM
+- **Expected Speedup:** 10-20% for large datasets
+- **Description:** Instead of processing pairs one at a time (which causes cache misses when accessing different strings), process in batches that fit in L2 cache. Pre-fetch next batch while processing current.
+- **Algorithm:**
+  ```rust
+  /// Process strings in batches that fit in L2 cache
+  const L2_BATCH_SIZE: usize = 256; // Tune based on typical L2 size (256KB-1MB)
+  
+  fn jaro_winkler_batch_optimized(
+      ca: &StringChunked, 
+      other: &StringChunked
+  ) -> Float32Chunked {
+      let len = ca.len();
+      let mut results = Vec::with_capacity(len);
+      
+      // Process in L2-cache-friendly batches
+      let pairs: Vec<_> = ca.iter().zip(other.iter()).collect();
+      
+      for batch in pairs.chunks(L2_BATCH_SIZE) {
+          // Prefetch next batch (hint to CPU)
+          #[cfg(target_arch = "x86_64")]
+          if batch.len() == L2_BATCH_SIZE {
+              // prefetch next batch's data
+          }
+          
+          for (a, b) in batch {
+              results.push(jaro_winkler_similarity_impl(*a, *b));
+          }
+      }
+      
+      Float32Chunked::from_iter(results)
+  }
+  ```
+- **Subtasks:**
+  - Subtask 145.1: Profile cache miss patterns in current implementation
+  - Subtask 145.2: Implement batch collection from ChunkedArray
+  - Subtask 145.3: Determine optimal batch size via benchmarking (L2/L3 trade-off)
+  - Subtask 145.4: Add software prefetching hints for next batch
+  - Subtask 145.5: Combine with parallel processing (parallel batches)
+  - Subtask 145.6: Benchmark cache hit rates before/after optimization
+- **Test Strategy:** Use perf counters to measure cache behavior, benchmark throughput
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+### Task 146: Jaro-Winkler for Long Strings (>64 chars)
+- **Goal:** Optimize Jaro-Winkler for strings longer than 64 characters
+- **Priority:** LOW-MEDIUM
+- **Expected Speedup:** 2-3x for strings 65-256 chars
+- **Description:** Current implementation falls back to slower paths for strings >64 chars. Implement a specialized version using u128 bitmasks for 65-128 chars and chunked processing for longer strings.
+- **Algorithm:**
+  ```rust
+  /// Jaro similarity for medium-long strings (65-128 chars)
+  fn jaro_similarity_medium_long(s1: &[u8], s2: &[u8]) -> f32 {
+      debug_assert!(s1.len() <= 128 && s2.len() <= 128);
+      
+      // Use u128 bitmasks for match tracking
+      let mut s1_matches: u128 = 0;
+      let mut s2_matches: u128 = 0;
+      
+      // Position-based lookup still works, just with larger bitmasks
+      // ... (similar to Task 141 but with u128)
+  }
+  
+  /// Jaro similarity for long strings (>128 chars) using block processing
+  fn jaro_similarity_long_blocked(s1: &[u8], s2: &[u8]) -> f32 {
+      const BLOCK_SIZE: usize = 64;
+      
+      // Process in blocks, tracking matches across block boundaries
+      // Use Vec<u64> for match tracking
+      // ... (blocked algorithm)
+  }
+  ```
+- **Subtasks:**
+  - Subtask 146.1: Implement `jaro_similarity_u128()` for strings 65-128 chars
+  - Subtask 146.2: Implement `jaro_similarity_blocked_v2()` for strings >128 chars
+  - Subtask 146.3: Optimize cross-block transposition counting
+  - Subtask 146.4: Integrate into dispatch in `jaro_similarity_bytes_optimized()`
+  - Subtask 146.5: Benchmark on varying string lengths (50, 100, 200, 500 chars)
+- **Test Strategy:** Verify correctness on long strings, benchmark length scaling
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+### Task 147: Unified Jaro-Winkler Dispatcher Optimization
+- **Goal:** Reduce dispatch overhead and ensure optimal path selection
+- **Priority:** MEDIUM
+- **Expected Speedup:** 5-10% overall
+- **Description:** Consolidate and optimize the dispatch logic in `jaro_similarity_bytes_optimized()` to minimize branching overhead and ensure the fastest path is always selected based on string characteristics.
+- **Subtasks:**
+  - Subtask 147.1: Profile dispatch overhead in current implementation
+  - Subtask 147.2: Consolidate redundant dispatch checks
+  - Subtask 147.3: Implement length-based jump table for O(1) path selection
+  - Subtask 147.4: Remove dead code paths and redundant conditions
+  - Subtask 147.5: Add `#[cold]` attributes to unlikely error paths
+  - Subtask 147.6: Benchmark dispatch overhead before/after
+- **Test Strategy:** Ensure all paths are still reachable and correct, profile overhead
+- **Code Location:** `polars/crates/polars-ops/src/chunked_array/strings/similarity.rs`
+
+### Phase 18 Success Criteria
+- **Task 141 (Position-Based):** 2x+ speedup on 10K pairs, len=20 benchmark
+- **Task 142 (AVX2 SIMD):** Additional 1.3x speedup when combined with Task 141
+- **Task 143 (Parallel):** Linear scaling on multi-core for 100K+ pairs
+- **Task 144 (Early Exit):** 10-30% speedup on threshold-based operations
+- **Task 145 (Cache Batch):** Measurable reduction in cache misses
+- **Task 146 (Long Strings):** Maintain performance for strings >64 chars
+- **Task 147 (Dispatcher):** Reduced dispatch overhead
+- **Overall Goal:** Achieve **≥1.0x speedup vs RapidFuzz** on all benchmark sizes (currently 0.37x on 100K pairs)
+
+### Phase 18 Dependencies
+- Task 141 (Position-Based) is independent - implement FIRST (highest impact)
+- Task 142 (AVX2 SIMD) can be implemented in parallel with Task 141
+- Task 143 (Parallel) depends on Tasks 141+142 being optimized first
+- Task 144 (Early Exit) is independent - can implement anytime
+- Task 145 (Cache Batch) depends on Task 143 for parallel integration
+- Task 146 (Long Strings) is independent - implement after core optimizations
+- Task 147 (Dispatcher) should be implemented LAST after all paths are finalized
+
+### Implementation Order Recommendation
+1. **Task 141** - Highest impact, implement first (expected 2-3x speedup)
+2. **Task 142** - High impact SIMD, can parallelize with Task 141
+3. **Task 144** - Quick win for threshold operations
+4. **Task 143** - Parallel processing for scale
+5. **Task 145** - Cache optimization
+6. **Task 146** - Long string support
+7. **Task 147** - Final cleanup and dispatch optimization

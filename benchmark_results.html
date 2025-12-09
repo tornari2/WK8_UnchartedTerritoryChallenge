@@ -164,22 +164,387 @@
         <h2>📊 Overall Summary</h2>
         <div class="summary-grid">
             <div class="summary-card">
-                <div class="value">0</div>
+                <div class="value">15</div>
                 <div class="label">Benchmark Tests</div>
             </div>
             <div class="summary-card">
-                <div class="value">0/0</div>
+                <div class="value">14/15</div>
                 <div class="label">Polars Wins</div>
             </div>
             <div class="summary-card">
-                <div class="value">1.00x</div>
+                <div class="value">3.36x</div>
                 <div class="label">Avg Speedup</div>
             </div>
             <div class="summary-card">
-                <div class="value">1.00x</div>
+                <div class="value">12.56x</div>
                 <div class="label">Max Speedup</div>
             </div>
         </div>
+    </div>
+
+    <div class="metric-section">
+        <div class="metric-title metric-levenshtein">Levenshtein</div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Dataset</th>
+                    <th class="number">Pairs</th>
+                    <th>Library</th>
+                    <th class="number">Time (s)</th>
+                    <th class="number">Throughput (pairs/s)</th>
+                    <th class="number">Speedup</th>
+                </tr>
+            </thead>
+            <tbody>
+
+                <tr>
+                    <td><span class="dataset-label">1K pairs, len=10</span></td>
+                    <td class="number">1,000</td>
+                    <td class="polars">Polars</td>
+                    <td class="number">0.000152</td>
+                    <td class="number">6,593,410</td>
+                    <td class="number speedup speedup-win">Polars 1.11x faster</td>
+                </tr>
+
+                <tr>
+                    <td></td>
+                    <td></td>
+                    <td class="rapidfuzz">RapidFuzz</td>
+                    <td class="number">0.000168</td>
+                    <td class="number">5,942,950</td>
+                    <td></td>
+                </tr>
+
+                <tr>
+                    <td><span class="dataset-label">10K pairs, len=20</span></td>
+                    <td class="number">10,000</td>
+                    <td class="polars">Polars</td>
+                    <td class="number">0.001622</td>
+                    <td class="number">6,166,083</td>
+                    <td class="number speedup speedup-win">Polars 1.30x faster</td>
+                </tr>
+
+                <tr>
+                    <td></td>
+                    <td></td>
+                    <td class="rapidfuzz">RapidFuzz</td>
+                    <td class="number">0.002113</td>
+                    <td class="number">4,732,048</td>
+                    <td></td>
+                </tr>
+
+                <tr>
+                    <td><span class="dataset-label">100K pairs, len=30 (LARGE)</span></td>
+                    <td class="number">100,000</td>
+                    <td class="polars">Polars</td>
+                    <td class="number">0.014260</td>
+                    <td class="number">7,012,430</td>
+                    <td class="number speedup speedup-win">Polars 1.59x faster</td>
+                </tr>
+
+                <tr>
+                    <td></td>
+                    <td></td>
+                    <td class="rapidfuzz">RapidFuzz</td>
+                    <td class="number">0.022612</td>
+                    <td class="number">4,422,527</td>
+                    <td></td>
+                </tr>
+
+            </tbody>
+        </table>
+    </div>
+
+    <div class="metric-section">
+        <div class="metric-title metric-damerau_levenshtein">Damerau-Levenshtein</div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Dataset</th>
+                    <th class="number">Pairs</th>
+                    <th>Library</th>
+                    <th class="number">Time (s)</th>
+                    <th class="number">Throughput (pairs/s)</th>
+                    <th class="number">Speedup</th>
+                </tr>
+            </thead>
+            <tbody>
+
+                <tr>
+                    <td><span class="dataset-label">1K pairs, len=10</span></td>
+                    <td class="number">1,000</td>
+                    <td class="polars">Polars</td>
+                    <td class="number">0.000159</td>
+                    <td class="number">6,304,510</td>
+                    <td class="number speedup speedup-win">Polars 1.95x faster</td>
+                </tr>
+
+                <tr>
+                    <td></td>
+                    <td></td>
+                    <td class="rapidfuzz">RapidFuzz</td>
+                    <td class="number">0.000309</td>
+                    <td class="number">3,237,030</td>
+                    <td></td>
+                </tr>
+
+                <tr>
+                    <td><span class="dataset-label">10K pairs, len=20</span></td>
+                    <td class="number">10,000</td>
+                    <td class="polars">Polars</td>
+                    <td class="number">0.001223</td>
+                    <td class="number">8,173,831</td>
+                    <td class="number speedup speedup-win">Polars 6.49x faster</td>
+                </tr>
+
+                <tr>
+                    <td></td>
+                    <td></td>
+                    <td class="rapidfuzz">RapidFuzz</td>
+                    <td class="number">0.007942</td>
+                    <td class="number">1,259,168</td>
+                    <td></td>
+                </tr>
+
+                <tr>
+                    <td><span class="dataset-label">100K pairs, len=30 (LARGE)</span></td>
+                    <td class="number">100,000</td>
+                    <td class="polars">Polars</td>
+                    <td class="number">0.014175</td>
+                    <td class="number">7,054,558</td>
+                    <td class="number speedup speedup-win">Polars 12.56x faster</td>
+                </tr>
+
+                <tr>
+                    <td></td>
+                    <td></td>
+                    <td class="rapidfuzz">RapidFuzz</td>
+                    <td class="number">0.178020</td>
+                    <td class="number">561,735</td>
+                    <td></td>
+                </tr>
+
+            </tbody>
+        </table>
+    </div>
+
+    <div class="metric-section">
+        <div class="metric-title metric-jaro_winkler">Jaro-Winkler</div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Dataset</th>
+                    <th class="number">Pairs</th>
+                    <th>Library</th>
+                    <th class="number">Time (s)</th>
+                    <th class="number">Throughput (pairs/s)</th>
+                    <th class="number">Speedup</th>
+                </tr>
+            </thead>
+            <tbody>
+
+                <tr>
+                    <td><span class="dataset-label">1K pairs, len=10</span></td>
+                    <td class="number">1,000</td>
+                    <td class="polars">Polars</td>
+                    <td class="number">0.000162</td>
+                    <td class="number">6,174,738</td>
+                    <td class="number speedup speedup-win">Polars 1.05x faster</td>
+                </tr>
+
+                <tr>
+                    <td></td>
+                    <td></td>
+                    <td class="rapidfuzz">RapidFuzz</td>
+                    <td class="number">0.000170</td>
+                    <td class="number">5,867,683</td>
+                    <td></td>
+                </tr>
+
+                <tr>
+                    <td><span class="dataset-label">10K pairs, len=20</span></td>
+                    <td class="number">10,000</td>
+                    <td class="polars">Polars</td>
+                    <td class="number">0.000708</td>
+                    <td class="number">14,131,607</td>
+                    <td class="number speedup speedup-win">Polars 2.70x faster</td>
+                </tr>
+
+                <tr>
+                    <td></td>
+                    <td></td>
+                    <td class="rapidfuzz">RapidFuzz</td>
+                    <td class="number">0.001908</td>
+                    <td class="number">5,241,181</td>
+                    <td></td>
+                </tr>
+
+                <tr>
+                    <td><span class="dataset-label">100K pairs, len=30 (LARGE)</span></td>
+                    <td class="number">100,000</td>
+                    <td class="polars">Polars</td>
+                    <td class="number">0.014935</td>
+                    <td class="number">6,695,790</td>
+                    <td class="number speedup speedup-win">Polars 1.37x faster</td>
+                </tr>
+
+                <tr>
+                    <td></td>
+                    <td></td>
+                    <td class="rapidfuzz">RapidFuzz</td>
+                    <td class="number">0.020497</td>
+                    <td class="number">4,878,755</td>
+                    <td></td>
+                </tr>
+
+            </tbody>
+        </table>
+    </div>
+
+    <div class="metric-section">
+        <div class="metric-title metric-hamming">Hamming</div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Dataset</th>
+                    <th class="number">Pairs</th>
+                    <th>Library</th>
+                    <th class="number">Time (s)</th>
+                    <th class="number">Throughput (pairs/s)</th>
+                    <th class="number">Speedup</th>
+                </tr>
+            </thead>
+            <tbody>
+
+                <tr>
+                    <td><span class="dataset-label">1K pairs, len=10</span></td>
+                    <td class="number">1,000</td>
+                    <td class="polars">Polars</td>
+                    <td class="number">0.000059</td>
+                    <td class="number">16,985,145</td>
+                    <td class="number speedup speedup-win">Polars 3.38x faster</td>
+                </tr>
+
+                <tr>
+                    <td></td>
+                    <td></td>
+                    <td class="rapidfuzz">RapidFuzz</td>
+                    <td class="number">0.000199</td>
+                    <td class="number">5,024,070</td>
+                    <td></td>
+                </tr>
+
+                <tr>
+                    <td><span class="dataset-label">10K pairs, len=20</span></td>
+                    <td class="number">10,000</td>
+                    <td class="polars">Polars</td>
+                    <td class="number">0.000391</td>
+                    <td class="number">25,595,085</td>
+                    <td class="number speedup speedup-win">Polars 5.15x faster</td>
+                </tr>
+
+                <tr>
+                    <td></td>
+                    <td></td>
+                    <td class="rapidfuzz">RapidFuzz</td>
+                    <td class="number">0.002013</td>
+                    <td class="number">4,968,821</td>
+                    <td></td>
+                </tr>
+
+                <tr>
+                    <td><span class="dataset-label">100K pairs, len=30 (LARGE)</span></td>
+                    <td class="number">100,000</td>
+                    <td class="polars">Polars</td>
+                    <td class="number">0.004173</td>
+                    <td class="number">23,963,957</td>
+                    <td class="number speedup speedup-win">Polars 4.81x faster</td>
+                </tr>
+
+                <tr>
+                    <td></td>
+                    <td></td>
+                    <td class="rapidfuzz">RapidFuzz</td>
+                    <td class="number">0.020078</td>
+                    <td class="number">4,980,557</td>
+                    <td></td>
+                </tr>
+
+            </tbody>
+        </table>
+    </div>
+
+    <div class="metric-section">
+        <div class="metric-title metric-cosine">Cosine (Vector, dim=30)</div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Dataset</th>
+                    <th class="number">Pairs</th>
+                    <th>Library</th>
+                    <th class="number">Time (s)</th>
+                    <th class="number">Throughput (pairs/s)</th>
+                    <th class="number">Speedup</th>
+                </tr>
+            </thead>
+            <tbody>
+
+                <tr>
+                    <td><span class="dataset-label">1K pairs, dim=10</span></td>
+                    <td class="number">1,000</td>
+                    <td class="polars">Polars</td>
+                    <td class="number">0.000168</td>
+                    <td class="number">5,955,345</td>
+                    <td class="number speedup speedup-lose">NumPy 3.68x faster</td>
+                </tr>
+
+                <tr>
+                    <td></td>
+                    <td></td>
+                    <td class="numpy">NumPy</td>
+                    <td class="number">0.000046</td>
+                    <td class="number">21,905,811</td>
+                    <td></td>
+                </tr>
+
+                <tr>
+                    <td><span class="dataset-label">10K pairs, dim=20</span></td>
+                    <td class="number">10,000</td>
+                    <td class="polars">Polars</td>
+                    <td class="number">0.000286</td>
+                    <td class="number">34,947,730</td>
+                    <td class="number speedup speedup-win">Polars 1.90x faster</td>
+                </tr>
+
+                <tr>
+                    <td></td>
+                    <td></td>
+                    <td class="numpy">NumPy</td>
+                    <td class="number">0.000544</td>
+                    <td class="number">18,397,009</td>
+                    <td></td>
+                </tr>
+
+                <tr>
+                    <td><span class="dataset-label">100K pairs, dim=30 (LARGE)</span></td>
+                    <td class="number">100,000</td>
+                    <td class="polars">Polars</td>
+                    <td class="number">0.001859</td>
+                    <td class="number">53,803,213</td>
+                    <td class="number speedup speedup-win">Polars 4.71x faster</td>
+                </tr>
+
+                <tr>
+                    <td></td>
+                    <td></td>
+                    <td class="numpy">NumPy</td>
+                    <td class="number">0.008762</td>
+                    <td class="number">11,412,670</td>
+                    <td></td>
+                </tr>
+
+            </tbody>
+        </table>
     </div>
 
 </body>

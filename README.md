@@ -16,12 +16,14 @@ This project extends [Polars](https://github.com/pola-rs/polars) with **native s
 
 | Feature | Description | Status |
 |---------|-------------|--------|
-| **Levenshtein Similarity** | Edit distance-based similarity (0.0-1.0) | ✅ 1.24-1.63x faster than RapidFuzz |
-| **Damerau-Levenshtein** | Edit distance with transpositions (OSA variant) | ✅ 1.98-2.35x faster than RapidFuzz |
-| **Jaro-Winkler** | Character-based similarity with prefix boost | ✅ 1.19-6.00x faster than RapidFuzz |
-| **Hamming** | Position-wise character comparison | ✅ 2.34-2.56x faster than RapidFuzz |
-| **Cosine Similarity** | Vector cosine similarity for arrays | ✅ 15.50-38.68x faster than NumPy |
+| **Levenshtein Similarity** | Edit distance-based similarity (0.0-1.0) | ✅ ~1.6x faster than RapidFuzz |
+| **Damerau-Levenshtein** | Edit distance with transpositions (OSA variant) | ✅ ~1.1x faster than RapidFuzz |
+| **Hamming** | Position-wise character comparison | ✅ ~3.8x faster than RapidFuzz |
+| **Jaro-Winkler** | Character-based similarity with prefix boost | ❌ RapidFuzz 4-5x faster (see notes) |
+| **Cosine Similarity** | Vector cosine similarity for arrays | ❌ NumPy 1.5-2.5x faster (see notes) |
 | **Fuzzy Join** | Full fuzzy join with blocking strategies | ✅ 1.5x-9.5x faster than pl-fuzzy-frame-match |
+
+> **Note on Jaro-Winkler/Cosine:** RapidFuzz and NumPy have more aggressive SIMD vectorization in their core loops. Our fuzzy_join() operation still wins at scale due to blocking strategies that reduce the number of comparisons.
 
 ### Quick Example
 
@@ -205,17 +207,19 @@ python benchmark_comparison_table.py
 
 ---
 
-## 📊 Performance Results
+## 📊 Performance Results (CORRECTED 2025-12-08)
 
-### Similarity Functions vs RapidFuzz
+### Element-Wise Similarity Functions vs RapidFuzz/NumPy
 
-| Metric | Small (1K) | Medium (10K) | Large (100K) |
-|--------|------------|--------------|--------------|
-| **Levenshtein** | 1.24x faster | 1.50x faster | 1.63x faster |
-| **Damerau-Levenshtein** | 1.98x faster | 2.10x faster | 2.35x faster |
-| **Jaro-Winkler** | 6.00x faster | 3.28x faster | 1.19x faster |
-| **Hamming** | 2.34x faster | 2.40x faster | 2.56x faster |
-| **Cosine** | 15.50x faster | 25.00x faster | 38.68x faster |
+| Metric | Polars vs Competitor | Winner |
+|--------|---------------------|--------|
+| **Hamming** | ~3.8x faster | ✅ Polars |
+| **Levenshtein** | ~1.6x faster | ✅ Polars |
+| **Damerau-Levenshtein** | ~1.1x faster | ✅ Polars |
+| **Jaro-Winkler** | RapidFuzz 4-5x faster | ❌ RapidFuzz |
+| **Cosine** | NumPy 1.5-2.5x faster | ❌ NumPy |
+
+> **Note:** Previous benchmark claims were inaccurate. These results are from verified runs of `benchmark_all_metrics.py` on 2025-12-08.
 
 ### Fuzzy Join vs pl-fuzzy-frame-match
 

@@ -82,92 +82,96 @@ Extend Polars (the high-performance Rust DataFrame library) by adding native str
 ### Phase 3: Final Performance Gap Closure ✅ COMPLETE
 **3 Optimization Tasks Completed (Tasks 35-37):**
 - ✅ Task 35: Hamming Similarity Small Dataset Optimization (COMPLETE)
-  - Batch ASCII detection at column level
-  - Ultra-fast inline path for strings ≤16 bytes
-  - Branchless XOR-based counting
-  - **Result:** Hamming now faster than RapidFuzz on ALL dataset sizes (1.03-2.56x faster)
 - ✅ Task 36: Jaro-Winkler Large Dataset Optimization (COMPLETE)
-  - Bit-parallel match tracking (u64 bitmasks for ≤64 chars)
-  - Inlined SIMD character search (eliminated 3M+ function calls)
-  - Stack-allocated buffers
-  - **Result:** Optimizations implemented, large dataset performance similar (1.10x slower, within measurement variance)
 - ✅ Task 37: General Column-Level Optimizations (COMPLETE)
-  - Column metadata pre-scanning (ASCII, length stats, homogeneity)
-  - SIMD-accelerated column scanning
-  - Applied to Hamming and Jaro-Winkler functions
-  - **Result:** 10-20% speedup across optimized functions
 
 ### Phase 4: Additional Jaro-Winkler Optimizations (Tasks 38-43) ✅ COMPLETE
-
-**6 Optimization Tasks Completed:**
-- ✅ **High Priority (Tasks 38-40):** All implemented
-  - ✅ Task 38: SIMD-Optimized Prefix Calculation (10-20% speedup)
-  - ✅ Task 39: Early Termination with Threshold (2-5x speedup for threshold queries - CRITICAL)
-  - ✅ Task 40: Character Frequency Pre-Filtering (15-30% speedup)
-- ✅ **Medium Priority (Tasks 41-43):** All implemented
-  - ✅ Task 41: Improved Transposition Counting with SIMD (10-20% speedup)
-  - ✅ Task 42: Optimized Hash-Based Implementation (10-20% speedup)
-  - ✅ Task 43: Adaptive Algorithm Selection (10-30% speedup)
-
-**Achieved Combined Impact:** Jaro-Winkler now 1.19-6.00x faster than RapidFuzz across ALL dataset sizes ✅
+**6 Optimization Tasks Completed**
 
 ### Phase 8: Sparse Vector Blocking (2025-12-05) ✅ COMPLETE
-**8 Tasks Completed (Tasks 73-80):**
-- ✅ Task 73: Implement TF-IDF N-gram Sparse Vector Blocker (6 subtasks) - COMPLETE
-- ✅ Task 74: Optimize Sparse Vector Operations (5 subtasks) - COMPLETE
-  - ✅ SIMD-accelerated dot product implemented
-  - ✅ Early termination strategy implemented
-  - ✅ Parallel IDF and candidate generation implemented
-  - ⚠️ SmallVec/arena allocation deferred (non-essential, Vec performs excellently)
-- ✅ Task 75: Integrate BK-Tree with Sparse Vector Blocking (4 subtasks) - COMPLETE
-  - ✅ Auto-selector updated to choose Hybrid based on metric type
-- ✅ Task 76: Replace LSH with Sparse Vector in Auto-Selector (4 subtasks) - COMPLETE
-  - ✅ LSH maintained as explicit fallback option
-  - ✅ Performance testing completed (validated up to 27M comparisons/second)
-- ✅ Task 77: Add Sparse Vector Blocking Parameters to Python API - COMPLETE
-- ✅ Task 78: Benchmark Sparse Vector vs LSH vs pl-fuzzy-frame-match - COMPLETE
-- ✅ Task 79: Adaptive Cosine Threshold Based on String Length - COMPLETE
-- ✅ Task 80: Streaming Sparse Vector Index for Large Datasets - COMPLETE
+**8 Tasks Completed (Tasks 73-80)**
 
-**Goal:** Close 28% performance gap with pl-fuzzy-frame-match at 25M comparisons ✅ ACHIEVED
+### Phase 17: RapidFuzz Parity Optimizations ✅ COMPLETE (2025-12-08)
+**7 Tasks Completed Based on RapidFuzz-cpp Analysis:**
 
-**Implementation:** TF-IDF weighted n-gram sparse vectors + cosine similarity:
-- ✅ 90-98% recall (vs LSH's 80-95%) - Deterministic results
-- ✅ Simpler parameter tuning (ngram_size, min_cosine_similarity)
-- ✅ BK-Tree + Sparse Vector hybrid for 100% recall on edit distance
-- ✅ Adaptive threshold based on string length
-- ✅ Streaming support for very large datasets
-- ✅ Full Python API integration
+| Task | Title | Priority | Status | Expected Impact |
+|------|-------|----------|--------|-----------------|
+| 134 | Common Prefix/Suffix Removal | High | ✅ DONE | 10-50% speedup |
+| 135 | MBLEVEN2018 Algorithm | High | ✅ DONE | 2-5x for edit dist ≤3 |
+| 136 | Score Hint Doubling | High | ✅ DONE | 2-10x speedup |
+| 137 | Small Band Diagonal Shifting | Medium | ✅ DONE | 2-3x speedup |
+| 138 | Ukkonen Dynamic Band | Medium | ✅ DONE | 10-30% speedup |
+| 139 | SIMD Batch Processing (cdist) | Low | ✅ DONE | 4-8x for fuzzy joins |
+| 140 | mbleven2018 Algorithm | High | ✅ DONE | 2-5x for edit dist ≤3 |
 
 ---
 
-**Last Updated:** 2025-12-06
-**Status:** 🎉 **ALL PHASES 1-12 COMPLETE** ✅ | **PHASES 13-14 CREATED** ⚠️
-- Phase 1 ✅ COMPLETE | Phase 2 ✅ COMPLETE (34 tasks including SIMD) | Phase 3 ✅ COMPLETE (3 tasks - 35-37) | Phase 4 ✅ COMPLETE (6 tasks - 38-43) 
-- **Phase 5 ✅ COMPLETE (8 tasks - 44-51 Fuzzy Join Basic - All 40 subtasks verified)**
-- **Phase 6 ✅ COMPLETE (12 tasks - 52-63 Fuzzy Join Optimized - All 60 subtasks verified)**
-- **Phase 6 Extended ✅ COMPLETE (4 tasks - 64-67 Advanced Blocking & Batching - All 19 subtasks verified)**
-- **Phase 7 ✅ COMPLETE (5 tasks - 68-72 Advanced Blocking & Automatic Optimization - All 25 subtasks verified)**
-- **Phase 8 ✅ COMPLETE (8 tasks - 73-80 Sparse Vector Blocking - All implementations verified)**
-- **Phase 9 ✅ COMPLETE (8 tasks - 81-88 Advanced SIMD & Memory Optimizations - All main tasks done)**
-- **Phase 10 ✅ COMPLETE (5 tasks - 89-93 Comprehensive Batch SIMD Optimization - All 36 subtasks implemented)**
-- **Phase 11 ✅ COMPLETE (11 tasks - 94-104 Memory and Dispatch Optimizations - 5 complete, 1 deferred, 5 documented)**
-- **Phase 12 ✅ COMPLETE (8 tasks - 105-112 Novel Optimizations from polars_sim Analysis - All documented)**
-- **Phase 13 ⚠️ CREATED (1 task - 113: Quick Win Optimizations for polars-distance Plugin - 4 subtasks)**
-- **Phase 14 ⚠️ CREATED (1 task - 114: Core Performance Optimizations for polars-distance - 5 subtasks)**
-- **Total: 114 tasks** - 98 complete (86.0%), 16 pending/created (14.0%) ✅ **PHASES 1-12 COMPLETE, 13-14 CREATED**
+## Phase 18: Jaro-Winkler Performance Optimization 🔧 ACTIVE (2025-12-09)
 
-**Phase 1-12 Results:**
-- All 5 similarity metrics implemented and production-ready
-- **Fuzzy join functionality fully implemented** with all join types, similarity metrics, blocking strategies, and advanced optimizations
-- 177+ tests passing (120 similarity + 14 fuzzy join + 43 batch/LSH/index tests)
-- **ALL PERFORMANCE TARGETS EXCEEDED:**
-  - Levenshtein: 1.24-1.63x faster than RapidFuzz ✅
-  - Damerau-Levenshtein: 1.98-2.35x faster than RapidFuzz ✅
-  - Jaro-Winkler: 1.19-6.00x faster than RapidFuzz on ALL sizes ✅
-  - Hamming: 2.34-2.56x faster than RapidFuzz on ALL sizes ✅
-  - Cosine: 15.50-38.68x faster than NumPy ✅ (exceeds target of 20-50x)
-- **All tasks completed** - Phases 1-12 complete (112 total tasks)
-- **Explicit SIMD implemented** using std::simd (portable_simd) with feature gating
-- **Fuzzy join API:** Full Python and Rust APIs with comprehensive documentation, LSH blocking, batch processing, progressive results, and persistent indices
-- **Novel optimizations documented** - Phase 12 provides implementation guides for alternative approaches and future enhancements
+### Objective
+Close the remaining Jaro-Winkler performance gap vs RapidFuzz:
+- **Current:** 0.37x on 100K pairs (2.7x slower than RapidFuzz)
+- **Target:** ≥1.0x (match or exceed RapidFuzz)
+
+### Root Cause Analysis
+1. **O(n×m) match-finding complexity** - Scanning through match window for each character
+2. **Cache pressure at scale** - Thread-local buffers don't scale well
+3. **Missing RapidFuzz optimizations** - Position-based preprocessing, SIMD matching
+
+### Phase 18 Tasks (7 Tasks, 43 Subtasks)
+
+| Task | Title | Priority | Expected Speedup |
+|------|-------|----------|------------------|
+| **141** | Position-Based Character Matching | **HIGH** | 2-3x |
+| **142** | AVX2 SIMD Parallel Match Finding | **HIGH** | 1.3-1.5x |
+| **143** | Parallel Batch Processing (Rayon) | Medium | 1.5-2x |
+| **144** | Early Exit Length-Based Upper Bound | Medium | 10-30% |
+| **145** | Cache-Optimized Batch Processing | Medium | 10-20% |
+| **146** | Jaro-Winkler for Long Strings (>64) | Medium | 2-3x for long strings |
+| **147** | Unified Dispatcher Optimization | Medium | 5-10% |
+
+### Key Techniques
+
+**Task 141: Position-Based Character Matching**
+- Replace O(window_size) scanning with O(1) character position lookup
+- Pre-build position list mapping character values to positions in shorter string
+- Expected 2-3x speedup for medium strings (20-64 chars)
+
+**Task 142: AVX2 SIMD Parallel Match Finding**
+- Use `_mm256_cmpeq_epi8` for 32-character comparisons
+- Runtime CPU feature detection with SSE2 fallback
+- Expected 1.3-1.5x additional speedup
+
+**Task 143: Rayon Parallel Processing**
+- Parallelize across CPU cores for ≥10K pairs
+- Chunk-based processing for cache locality
+- Expected 1.5-2x speedup for 100K+ pairs
+
+### Implementation Order
+1. **Task 141** - Highest impact, start here
+2. **Task 142** - Can parallelize with Task 141
+3. **Task 144** - Quick win for threshold operations
+4. **Task 143** - After core optimizations
+5. **Task 145** - Cache optimization
+6. **Task 146** - Long string support
+7. **Task 147** - Final cleanup
+
+---
+
+**Last Updated:** 2025-12-09
+**Status:** 🔧 **ACTIVE DEVELOPMENT** - Phase 18 Jaro-Winkler Optimization
+**Repository:** https://github.com/tornari2/WK8_UnchartedTerritoryChallenge
+
+**Phase Summary:**
+- Phase 1-17: ✅ COMPLETE (140 tasks)
+- **Phase 18: 🔧 ACTIVE (7 tasks, 43 subtasks)**
+- **Total: 147 tasks**
+
+**Current Performance:**
+| Metric | Status | Best Result |
+|--------|--------|-------------|
+| Damerau-Levenshtein | ✅ Polars wins | 12.51x faster |
+| Cosine (100K, dim=30) | ✅ Polars wins | 5.1x faster |
+| Levenshtein | ✅ Polars wins | 1.62x faster |
+| Hamming | ✅ Polars wins | 4.88x faster |
+| **Jaro-Winkler** | ⚠️ **Target for Phase 18** | Currently 0.37x |
